@@ -225,7 +225,7 @@ class PatchHouseholderMix(BasePatchOrthogonalMix):
 
 
 class ConvMLP(nn.Module):
-    def __init__(self, in_ch, out_ch, scale_bound, hidden_ch,num_classes, img_size: int = 32):
+    def __init__(self, in_ch, out_ch, scale_bound, hidden_ch, img_size: int = 32):
         super().__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
@@ -379,6 +379,19 @@ class ConvMLP(nn.Module):
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
 
+        # ConvPINNBlock(12 -> 6)
+        elif in_ch == 6 and out_ch == 6:
+            # [6,32,32] -> down 16 -> up 32 -> [6,32,32]
+            self.net = nn.Sequential(
+                nn.Conv2d(6, 64, 3, padding=1), nn.ReLU(),
+                nn.Conv2d(64, 128, 3, stride=2, padding=1), nn.ReLU(),          # 32->16
+                nn.Conv2d(128, 128, 3, padding=1), nn.ReLU(),
+                nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1), nn.ReLU(), # 16->32
+                nn.Conv2d(64, 6, 3, padding=1),
+            )
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+
         # ConvPINNBlock(48 -> 32)
         elif in_ch == 16 and out_ch == 32:
             self.net = nn.Sequential(
@@ -389,6 +402,19 @@ class ConvMLP(nn.Module):
                 nn.Conv2d(256, 512, 3, padding=1), nn.ReLU(),  # [512,16,16]
                 nn.Conv2d(512, 512, 3, stride=2, padding=1), nn.ReLU(),  # [512,8,8]
                 nn.Conv2d(512, 32, 3, padding=1),  # [32,8,8]
+            )
+            nn.init.zeros_(self.net[-1].weight)
+            nn.init.zeros_(self.net[-1].bias)
+
+        # ConvPINNBlock(48 -> 32):
+        elif in_ch == 32 and out_ch == 16:
+            # [32,8,8] -> [16,8,8]
+            self.net = nn.Sequential(
+                nn.Conv2d(32, 512, 3, padding=1), nn.ReLU(),  # [512,8,8]
+                nn.Conv2d(512, 256, 3, padding=1), nn.ReLU(), # [256,8,8]
+                nn.Conv2d(256, 128, 3, padding=1), nn.ReLU(), # [128,8,8]
+                nn.Conv2d(128, 64, 3, padding=1), nn.ReLU(),  # [64,8,8]
+                nn.Conv2d(64, 16, 3, padding=1),              # [16,8,8]
             )
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
@@ -407,31 +433,24 @@ class ConvMLP(nn.Module):
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
 
-        #ConvPINNBlock(1024 -> 40)
-        elif in_ch == 984 and out_ch == num_classes:
+        # ConvPINNBlock(1024 -> num_classes): t, s networks (compress: 1024-num_classes -> num_classes)
+        elif in_ch + out_ch == 1024 and in_ch >= out_ch:
             self.net = nn.Sequential(
-                nn.Conv2d(984, 512, 1), nn.ReLU(),
-                nn.Conv2d(512, 256, 1),
-                #nn.GroupNorm(1, 256),
-                nn.ReLU(),
-                nn.Conv2d(256, 128, 1),
-                #nn.GroupNorm(1, 128),
-                nn.ReLU(),
-                nn.Conv2d(128, num_classes, 1),
+                nn.Conv2d(in_ch, 512, 1), nn.ReLU(),
+                nn.Conv2d(512, 256, 1), nn.ReLU(),
+                nn.Conv2d(256, 128, 1), nn.ReLU(),
+                nn.Conv2d(128, out_ch, 1),
             )
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
 
-        elif in_ch == num_classes and out_ch == 984:
+        # ConvPINNBlock(1024 -> num_classes): r network (expand: num_classes -> 1024-num_classes)
+        elif in_ch + out_ch == 1024 and in_ch < out_ch:
             self.net = nn.Sequential(
-                nn.Conv2d(num_classes, 128, 1), nn.ReLU(),
-                nn.Conv2d(128, 256, 1),
-                #nn.GroupNorm(1, 256),
-                nn.ReLU(),
-                nn.Conv2d(256, 512, 1),
-                #nn.GroupNorm(1, 512),
-                nn.ReLU(),
-                nn.Conv2d(512, 984, 1),
+                nn.Conv2d(in_ch, 128, 1), nn.ReLU(),
+                nn.Conv2d(128, 256, 1), nn.ReLU(),
+                nn.Conv2d(256, 512, 1), nn.ReLU(),
+                nn.Conv2d(512, out_ch, 1),
             )
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
@@ -481,48 +500,48 @@ class PixelUnshuffleBlock(nn.Module):
 
 
 class PINN(nn.Module):
-    def __init__(self, block_cls, layer_channels, img_size: int = 64, num_classes=40, **block_kwargs):
+    def __init__(self, block_cls, layer_channels, img_size: int = 64, num_classes=40, mix_type: str = "cayley", **block_kwargs):
         super().__init__()
 
         if img_size == 64:
             self.blocks = nn.ModuleList([
                 PixelUnshuffleBlock(2),              # [3,64,64] -> [12,32,32]
-                ConvPINNBlock(12, 6, hidden=128, scale_bound=2.0),
-                ConvPINNBlock(6, 3, hidden=128, scale_bound=2.0),
+                ConvPINNBlock(12, 6, hidden=128, scale_bound=2.0, mix_type=mix_type),
+                ConvPINNBlock(6, 3, hidden=128, scale_bound=2.0, mix_type=mix_type),
 
                 PixelUnshuffleBlock(4),              # [3,32,32] -> [48,8,8]
-                ConvPINNBlock(48, 32, hidden=128, scale_bound=2.0),
+                ConvPINNBlock(48, 32, hidden=128, scale_bound=2.0, mix_type=mix_type),
 
                 PixelUnshuffleBlock(8),              # [32,8,8] -> [2048,1,1]
-                ConvPINNBlock(2048, 1024, hidden=128, scale_bound=2.0),
+                ConvPINNBlock(2048, 1024, hidden=128, scale_bound=2.0, mix_type=mix_type),
 
-                ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0),
+                ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0, mix_type=mix_type),
             ])
         elif img_size == 256:
             self.blocks = nn.ModuleList([
                 PixelUnshuffleBlock(4),  # [3,256,256] -> [48,64,64]
-                ConvPINNBlock(48, 12, hidden=128, scale_bound=2.0, img_size=256),
+                ConvPINNBlock(48, 12, hidden=128, scale_bound=2.0, img_size=256, mix_type=mix_type),
 
                 PixelUnshuffleBlock(4),  # [12,64,64] -> [192,16,16]
-                ConvPINNBlock(192, 48, hidden=128, scale_bound=2.0, img_size=256),
+                ConvPINNBlock(192, 48, hidden=128, scale_bound=2.0, img_size=256, mix_type=mix_type),
 
                 PixelUnshuffleBlock(4),  # [48,16,16] -> [768,4,4]
-                ConvPINNBlock(768, 192, hidden=128, scale_bound=2.0, img_size=256),
+                ConvPINNBlock(768, 192, hidden=128, scale_bound=2.0, img_size=256, mix_type=mix_type),
 
                 PixelUnshuffleBlock(4),  # [192,4,4] -> [3072,1,1]
-                ConvPINNBlock(3072, 1024, hidden=128, scale_bound=2.0, img_size=256),
+                ConvPINNBlock(3072, 1024, hidden=128, scale_bound=2.0, img_size=256, mix_type=mix_type),
 
-                ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0, img_size=256),
+                ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0, img_size=256, mix_type=mix_type),
             ])
         else: # if img_size == 32
             self.blocks = nn.ModuleList([
                 PixelUnshuffleBlock(4),  # [3,32,32] -> [48,8,8]
-                ConvPINNBlock(48, 32, hidden=128, scale_bound=2.0),
+                ConvPINNBlock(48, 32, hidden=128, scale_bound=2.0, mix_type=mix_type),
 
                 PixelUnshuffleBlock(8),  # [32,8,8] -> [2048,1,1]
-                ConvPINNBlock(2048, 1024, hidden=128, scale_bound=2.0),
+                ConvPINNBlock(2048, 1024, hidden=128, scale_bound=2.0, mix_type=mix_type),
 
-                ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0),
+                ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0, mix_type=mix_type),
             ])
         #if img_size == 28: # if img_size == 32
         #img_size == 28, img_ch == 1
@@ -612,6 +631,7 @@ class SPNN(nn.Module):
         hidden: int = 128,
         scale_bound: float = 2.0,
         img_size: int = 64,
+        mix_type: str = "cayley",
     ):
         super().__init__()
         assert img_size in (32, 64, 256), "img_size must be 32, 64 or 256"
@@ -622,7 +642,7 @@ class SPNN(nn.Module):
         self.scale_bound = scale_bound
         self.img_size = img_size
 
-        self.pinn = PINN(block_cls=None, layer_channels=None, img_size=img_size)
+        self.pinn = PINN(block_cls=None, layer_channels=None, img_size=img_size, mix_type=mix_type)
 
     def forward(self, x_img, return_latents=False):
         B, C, H, W = x_img.shape

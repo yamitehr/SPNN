@@ -225,7 +225,7 @@ class PatchHouseholderMix(BasePatchOrthogonalMix):
 
 
 class ConvMLP(nn.Module):
-    def __init__(self, in_ch, out_ch, scale_bound, hidden_ch, img_size: int = 32):
+    def __init__(self, in_ch, out_ch, scale_bound, hidden_ch, img_size: int = 32, feat_size: int = None):
         super().__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
@@ -455,13 +455,41 @@ class ConvMLP(nn.Module):
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
 
-        # Default case: old simple 2-layer ConvMLP for all other (in_ch, out_ch)
+        # Default case: auto-scaled architecture for arbitrary (in_ch, out_ch, feat_size)
         elif in_ch > 0:
-            self.net = nn.Sequential(
-                nn.Conv2d(in_ch, hidden_ch, 3, padding=1), nn.ReLU(),
-                nn.Conv2d(hidden_ch, hidden_ch, 3, padding=1), nn.ReLU(),
-                nn.Conv2d(hidden_ch, out_ch, 3, padding=1)
-            )
+            h1 = min(max(hidden_ch, in_ch), 1024)
+            h2 = min(h1 * 2, 2048)
+            if feat_size is not None and feat_size > 1:
+                assert feat_size % 2 == 0, (
+                    f"feat_size must be even when using the stride-2 path (got feat_size={feat_size}). "
+                    f"ConvTranspose2d(kernel=4, stride=2, pad=1) restores H→H only for even H."
+                )
+                # Mirror the tailored cases: 2 convs → stride-2 down → conv → upsample → out
+                self.net = nn.Sequential(
+                    nn.Conv2d(in_ch, h1, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(h1, h1, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(h1, h2, 3, stride=2, padding=1), nn.ReLU(),
+                    nn.Conv2d(h2, h2, 3, padding=1), nn.ReLU(),
+                    nn.ConvTranspose2d(h2, h1, 4, stride=2, padding=1), nn.ReLU(),
+                    nn.Conv2d(h1, out_ch, 3, padding=1),
+                )
+            elif feat_size == 1:
+                # 1x1 spatial: use pointwise convs like the tailored 1x1 cases
+                self.net = nn.Sequential(
+                    nn.Conv2d(in_ch, h1, 1), nn.ReLU(),
+                    nn.Conv2d(h1, h2, 1), nn.ReLU(),
+                    nn.Conv2d(h2, h1, 1), nn.ReLU(),
+                    nn.Conv2d(h1, out_ch, 1),
+                )
+            else:
+                # feat_size unknown:
+                self.net = nn.Sequential(
+                    nn.Conv2d(in_ch, h1, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(h1, h2, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(h2, h2, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(h2, h1, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(h1, out_ch, 3, padding=1),
+                )
             nn.init.zeros_(self.net[-1].weight)
             nn.init.zeros_(self.net[-1].bias)
 
@@ -533,7 +561,7 @@ class PINN(nn.Module):
 
                 ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0, img_size=256, mix_type=mix_type),
             ])
-        else: # if img_size == 32
+        elif img_size == 32:
             self.blocks = nn.ModuleList([
                 PixelUnshuffleBlock(4),  # [3,32,32] -> [48,8,8]
                 ConvPINNBlock(48, 32, hidden=128, scale_bound=2.0, mix_type=mix_type),
@@ -543,6 +571,43 @@ class PINN(nn.Module):
 
                 ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0, mix_type=mix_type),
             ])
+
+        else:
+            # DIY network: build blocks from user-provided block_cls and layer_channels.
+            #
+            # Each entry in layer_channels must be one of:
+            #   (BlockClass, kwargs_dict)  – per-block class + constructor kwargs
+            #   kwargs_dict                – constructor kwargs using the shared block_cls
+            #
+            # Example:
+            #   layer_channels = [
+            #       (PixelUnshuffleBlock, {"r": 4}),                              # [3,H,W] -> [48,H/4,W/4]
+            #       (ConvPINNBlock, {"in_ch": 48, "out_ch": 12, "hidden": 128, "scale_bound": 2.0}),
+            #       (ConvPINNBlock, {"in_ch": 12, "out_ch": num_classes, "hidden": 128, "scale_bound": 2.0}),
+            #   ]
+            if not layer_channels:
+                raise ValueError("layer_channels must be a non-empty list for custom architectures")
+
+            blocks = []
+            for spec in layer_channels:
+                if isinstance(spec, (list, tuple)) and len(spec) == 2 and isinstance(spec[1], dict):
+                    cls, kwargs = spec
+                elif isinstance(spec, dict):
+                    if block_cls is None:
+                        raise ValueError(
+                            "block_cls must be provided when layer_channels entries are plain dicts"
+                        )
+                    cls, kwargs = block_cls, spec
+                else:
+                    raise ValueError(
+                        f"Each layer_channels entry must be a (BlockClass, kwargs_dict) tuple "
+                        f"or a kwargs dict (with block_cls set), got {type(spec)}"
+                    )
+                # block_kwargs are shared defaults; per-block kwargs take priority
+                merged = {**block_kwargs, **kwargs}
+                blocks.append(cls(**merged))
+            self.blocks = nn.ModuleList(blocks)
+
         #if img_size == 28: # if img_size == 32
         #img_size == 28, img_ch == 1
         # self.blocks = nn.ModuleList([
@@ -590,8 +655,12 @@ class PINN(nn.Module):
 
 
 class ConvPINNBlock(nn.Module):
-    def __init__(self, in_ch, out_ch, hidden=64, scale_bound=2., img_size: int = 32, mix_type: str = "cayley"):
+    def __init__(self, in_ch, out_ch, hidden=64, scale_bound=2., img_size: int = 32, mix_type: str = "cayley", feat_size: int = None):
         super().__init__()
+        assert in_ch > out_ch, (
+            f"ConvPINNBlock requires in_ch > out_ch (got in_ch={in_ch}, out_ch={out_ch}). "
+            f"The coupling layer splits channels as x0=[:out_ch], x1=[out_ch:], so in_ch must be strictly larger."
+        )
 
         layers = {
             "t": (in_ch - out_ch, out_ch, None, hidden),
@@ -600,7 +669,7 @@ class ConvPINNBlock(nn.Module):
         }
 
         for name, (in_s, out_s, sb, hid) in layers.items():
-            setattr(self, name, ConvMLP(in_s, out_s, sb, hid, img_size=img_size))
+            setattr(self, name, ConvMLP(in_s, out_s, sb, hid, img_size=img_size, feat_size=feat_size))
 
         if mix_type == "householder":
             self.mix = Householder1x1Conv(in_ch)
@@ -658,7 +727,7 @@ class SPNN(nn.Module):
 
         return (logits, latents) if return_latents else logits
 
-    def pinv_logits(self, logits, latents=None):
+    def pinv(self, logits, latents=None):
         B, C = logits.shape
         assert C == self.num_classes
 

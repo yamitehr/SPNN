@@ -608,30 +608,6 @@ class PINN(nn.Module):
                 blocks.append(cls(**merged))
             self.blocks = nn.ModuleList(blocks)
 
-        #if img_size == 28: # if img_size == 32
-        #img_size == 28, img_ch == 1
-        # self.blocks = nn.ModuleList([
-        #     PixelUnshuffleBlock(4),  # [1,28,28] -> [16,7,7]
-        #     ConvPINNBlock(16, 12, hidden=128, scale_bound=2.0),
-        #
-        #     PixelUnshuffleBlock(7),  # [12,7,7] -> [588,1,1]
-        #     ConvPINNBlock(588, 256, hidden=128, scale_bound=2.0),
-        #
-        #     ConvPINNBlock(256, num_classes, hidden=128, scale_bound=2.0),
-        # ])
-
-        # linearizer mnist
-        # img_size == 32, img_ch == 1
-        # self.blocks = nn.ModuleList([
-        #     PixelUnshuffleBlock(4),  # [1,32,32] -> [16,8,8]
-        #     ConvPINNBlock(16, 12, hidden=128, scale_bound=2.0),
-        #
-        #     PixelUnshuffleBlock(8),  # [12,8,8] -> [768,1,1]
-        #     ConvPINNBlock(768, 256, hidden=128, scale_bound=2.0),
-        #
-        #     ConvPINNBlock(256, num_classes, hidden=128, scale_bound=2.0),
-        # ])
-
     def forward(self, x, return_latents=False):
         latents = []
         
@@ -701,9 +677,16 @@ class SPNN(nn.Module):
         scale_bound: float = 2.0,
         img_size: int = 64,
         mix_type: str = "cayley",
+        block_cls=None,
+        layer_channels=None,
+        **block_kwargs,
     ):
         super().__init__()
-        assert img_size in (32, 64, 256), "img_size must be 32, 64 or 256"
+        if layer_channels is None:
+            assert img_size in (32, 64, 256), (
+                f"img_size must be 32, 64 or 256 for built-in architectures (got {img_size}). "
+                "To use a custom size, pass your own block definitions via layer_channels."
+            )
         assert num_classes < 1024, "num of classes (output size) must be less then 1024"
         self.img_ch = img_ch
         self.num_classes = num_classes
@@ -711,7 +694,7 @@ class SPNN(nn.Module):
         self.scale_bound = scale_bound
         self.img_size = img_size
 
-        self.pinn = PINN(block_cls=None, layer_channels=None, img_size=img_size, mix_type=mix_type)
+        self.pinn = PINN(block_cls=block_cls, layer_channels=layer_channels, img_size=img_size, mix_type=mix_type, **block_kwargs)
 
     def forward(self, x_img, return_latents=False):
         B, C, H, W = x_img.shape

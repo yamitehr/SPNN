@@ -142,6 +142,7 @@ def main():
                 num_classes=40, H=args.img_size, W=args.img_size,
                 epochs=args.r_opt_epochs, lr=args.r_opt_lr, batch_size=args.r_opt_batch_size, img_size=args.img_size,
                 out_checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"),
+                mix_type=args.mix_type,
             )
 
             penrose_after = penrose_checker.run_penrose_batched(

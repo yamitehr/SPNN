@@ -1,0 +1,18 @@
+# Core deep learning
+# Install PyTorch with the appropriate CUDA version for your system:
+# https://pytorch.org/get-started/locally/
+torch>=2.0.0
+torchvision>=0.15.0
+
+# General
+numpy>=1.23.0
+Pillow>=9.0.0
+tqdm>=4.64.0
+pyyaml>=6.0
+requests>=2.28.0
+
+# Model hub (inference - loading pretrained SPNN checkpoint)
+huggingface-hub>=0.16.0
+
+# Dataset download (optional - only needed if not providing --dataset_path)
+# kagglehub>=0.1.0

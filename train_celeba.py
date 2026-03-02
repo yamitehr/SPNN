@@ -49,13 +49,8 @@ def main():
     parser.add_argument('--is_forward_train', action="store_true")
     args = parser.parse_args()
 
-    # Dynamic checkpoint directory construction (used when --checkpoint_dir is not specified)
     if args.checkpoint_dir is None:
-        dir_name = (f"{args.model_type}_forward_{args.is_forward_train}_ropt_{args.is_r_opt}_"
-                    f"bce_{args.lambda_bce}_ri_{args.lambda_right_inverse}_rec_{args.lambda_img_rec}_"
-                    f"rnorm_{args.lambda_r_norm}_rrec_{args.lambda_r_rec}_"
-                    f"rcycle_{args.lambda_r_cycle}")
-        args.checkpoint_dir = os.path.join("check_points", dir_name)
+        args.checkpoint_dir = "check_points"
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
     logger = setup_logger(args.checkpoint_dir, logfile_name=args.log_file, logger_name='att_cls')

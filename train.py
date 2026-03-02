@@ -335,8 +335,8 @@ class CelebATrainer:
         model.eval()
         return
 
-    def train_r_opt_on_real_logits(self, checkpoint_path, device, loader, num_classes, H, W, epochs, lr, batch_size, out_checkpoint_path, img_size):
-        net = SPNN(img_ch=3, num_classes=num_classes, hidden=128, scale_bound=2.0, img_size=img_size).to(device)
+    def train_r_opt_on_real_logits(self, checkpoint_path, device, loader, num_classes, H, W, epochs, lr, batch_size, out_checkpoint_path, img_size, mix_type="cayley"):
+        net = SPNN(img_ch=3, num_classes=num_classes, hidden=128, scale_bound=2.0, img_size=img_size, mix_type=mix_type).to(device)
         state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
         net.load_state_dict(state_dict)
         net.eval()

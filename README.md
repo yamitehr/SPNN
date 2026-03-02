@@ -1,6 +1,6 @@
 # SPNN - Surjective Pseudo-Neural Network
 
-> A surjective classifier with a guaranteed pseudo-inverse, enabling attribute-guided image reconstruction via diffusion.
+> A surjective classifier with a guaranteed pseudo-inverse, enabling attribute-guided image reconstruction via non-linear back project and diffusion backbone.
 
 [[Paper](https://arxiv.org/abs/2602.06042)] &nbsp;|&nbsp; [[Pretrained Model (HuggingFace)](https://huggingface.co/yamitehr/SPNN)]
 

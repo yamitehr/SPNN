@@ -143,7 +143,6 @@ python train_celeba.py \
   --img_size 256 \
   --epoch 10 \
   --batch_size 256 \
-  --lr 2e-4 \
   --mix_type cayley
 ```
 

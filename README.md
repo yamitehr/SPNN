@@ -32,7 +32,7 @@ This section reproduces the main reconstruction task: using the SPNN pseudo-inve
 
 ### Example Result
 
-![Reconstruction example](assets/reconstruction_example.jpg)
+<img src="assets/reconstruction_example.jpg" width="600"/>
 
 *Reconstructed faces satisfying the target attributes.*
 
@@ -40,7 +40,7 @@ This section reproduces the main reconstruction task: using the SPNN pseudo-inve
 
 We use the CelebA-HQ 256×256 diffusion model from [SDEdit](https://github.com/ermongroup/SDEdit).
 
-1. Download the checkpoint from the link below:
+1. Download the checkpoint from the following link:
    **[celeba_hq.ckpt (Google Drive)](https://drive.google.com/file/d/1wSoA5fm_d6JBZk4RZ1SzWLMgev4WqH21/view?usp=share_link)**
 
 2. Place it at the following path:

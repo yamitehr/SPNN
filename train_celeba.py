@@ -19,7 +19,7 @@ def main():
     parser.add_argument('--epoch', type=int, default=10)
     parser.add_argument('--fix_epoch', type=float, default=0.4)
     parser.add_argument('--img_size', type=int, default=256)
-    parser.add_argument('--lr', type=int, default=2e-4)
+    parser.add_argument('--lr', type=float, default=2e-4)
     parser.add_argument('--beta1', type=float, default=0.9)
     parser.add_argument('--beta2', type=float, default=0.999)
     parser.add_argument('--k', type=int, default=100)
@@ -38,21 +38,24 @@ def main():
     parser.add_argument('--r_opt_lr', type=float, default=1e-4)
     parser.add_argument('--r_opt_batch_size', type=int, default=256)
     parser.add_argument('--seed', type=int, default=556)
-    parser.add_argument('--checkpoint_dir', type=str, default='check_points/models')
+    parser.add_argument('--checkpoint_dir', type=str, default=None,
+                        help='Checkpoint directory. Defaults to an auto-generated name under check_points/.')
     parser.add_argument('--setting_file', type=str, default='setting.txt')
     parser.add_argument('--log_file', type=str, default='log.txt')
     parser.add_argument('--dataset_path', type=str, default=None,
                         help='Path to the CelebAMask-HQ root directory. If not provided, the dataset will be downloaded via kagglehub (requires Kaggle API credentials).')
+    parser.add_argument('--mix_type', type=str, default='cayley', choices=['cayley', 'householder'])
     parser.add_argument('--is_r_opt', action="store_true")
     parser.add_argument('--is_forward_train', action="store_true")
     args = parser.parse_args()
 
-    # Dynamic checkpoint directory construction
-    dir_name = (f"{args.model_type}_forward_{args.is_forward_train}_ropt_{args.is_r_opt}_"
-                f"bce_{args.lambda_bce}_ri_{args.lambda_right_inverse}_rec_{args.lambda_img_rec}_"
-                f"rnorm_{args.lambda_r_norm}_rrec_{args.lambda_r_rec}_"
-                f"rcycle_{args.lambda_r_cycle}")
-    args.checkpoint_dir = os.path.join("check_points", dir_name)
+    # Dynamic checkpoint directory construction (used when --checkpoint_dir is not specified)
+    if args.checkpoint_dir is None:
+        dir_name = (f"{args.model_type}_forward_{args.is_forward_train}_ropt_{args.is_r_opt}_"
+                    f"bce_{args.lambda_bce}_ri_{args.lambda_right_inverse}_rec_{args.lambda_img_rec}_"
+                    f"rnorm_{args.lambda_r_norm}_rrec_{args.lambda_r_rec}_"
+                    f"rcycle_{args.lambda_r_cycle}")
+        args.checkpoint_dir = os.path.join("check_points", dir_name)
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_ids
     logger = setup_logger(args.checkpoint_dir, logfile_name=args.log_file, logger_name='att_cls')
@@ -101,7 +104,8 @@ def main():
         num_classes=40,
         hidden=128,
         scale_bound=2.0,
-        img_size=args.img_size
+        img_size=args.img_size,
+        mix_type=args.mix_type,
     ).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
@@ -116,49 +120,53 @@ def main():
     penrose_checker = PenroseChecker(logger)
     ginv_calculator = GinvNormCalculator(logger)
 
-    penrose_before = penrose_checker.run_penrose_batched(
-        checkpoint_path=os.path.join(args.checkpoint_dir, "best_model.pth"), test_loader=test_loader,
-        device=torch.device(device), img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size)
+    ckpt_path = os.path.join(args.checkpoint_dir, "best_model.pth")
+    if os.path.exists(ckpt_path):
+        penrose_before = penrose_checker.run_penrose_batched(
+            checkpoint_path=ckpt_path, test_loader=test_loader,
+            device=torch.device(device), img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type)
 
-    ginv_real_before = ginv_calculator.run(
-        checkpoint_path=os.path.join(args.checkpoint_dir, "best_model.pth"),
-        loader=test_loader,
-        device=torch.device(device),
-        model_cls=SPNN,
-        model_kwargs=dict(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size),
-    )
-
-    print("[Before r-opt] Penrose metrics:")
-    for k, v in penrose_before.items():
-        print(f"  penrose_before_r_opt/{k}: {v}")
-    print(f"  test/g'(y)_norm_before_r_opt: {float(ginv_real_before)}")
-
-    if args.is_r_opt:
-        r_opt_ckpt = trainer.train_r_opt_on_real_logits(
-            checkpoint_path=os.path.join(args.checkpoint_dir, "best_model.pth"),
-            device=torch.device(device),
-            loader=train_loader,
-            num_classes=40, H=args.img_size, W=args.img_size,
-            epochs=args.r_opt_epochs, lr=args.r_opt_lr, batch_size=args.r_opt_batch_size, img_size=256,
-            out_checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"),
-        )
-
-        penrose_after = penrose_checker.run_penrose_batched(
-            checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"), test_loader=test_loader,
-            device=torch.device(device), img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size)
-
-        ginv_real_after = ginv_calculator.run(
-            checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"),
+        ginv_real_before = ginv_calculator.run(
+            checkpoint_path=ckpt_path,
             loader=test_loader,
             device=torch.device(device),
             model_cls=SPNN,
-            model_kwargs=dict(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size),
+            model_kwargs=dict(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type),
         )
 
-        print("[After r-opt] Penrose metrics:")
-        for k, v in penrose_after.items():
-            print(f"  penrose_after_r_opt/{k}: {v}")
-        print(f"  test/g'(y)_norm_after_r_opt: {float(ginv_real_after)}")
+        print("[Before r-opt] Penrose metrics:")
+        for k, v in penrose_before.items():
+            print(f"  penrose_before_r_opt/{k}: {v}")
+        print(f"  test/g'(y)_norm_before_r_opt: {float(ginv_real_before)}")
+
+        if args.is_r_opt:
+            trainer.train_r_opt_on_real_logits(
+                checkpoint_path=ckpt_path,
+                device=torch.device(device),
+                loader=train_loader,
+                num_classes=40, H=args.img_size, W=args.img_size,
+                epochs=args.r_opt_epochs, lr=args.r_opt_lr, batch_size=args.r_opt_batch_size, img_size=args.img_size,
+                out_checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"),
+            )
+
+            penrose_after = penrose_checker.run_penrose_batched(
+                checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"), test_loader=test_loader,
+                device=torch.device(device), img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type)
+
+            ginv_real_after = ginv_calculator.run(
+                checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"),
+                loader=test_loader,
+                device=torch.device(device),
+                model_cls=SPNN,
+                model_kwargs=dict(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type),
+            )
+
+            print("[After r-opt] Penrose metrics:")
+            for k, v in penrose_after.items():
+                print(f"  penrose_after_r_opt/{k}: {v}")
+            print(f"  test/g'(y)_norm_after_r_opt: {float(ginv_real_after)}")
+    else:
+        print(f"No checkpoint found at {ckpt_path}, skipping diagnostics.")
 
 
 if __name__ == '__main__':

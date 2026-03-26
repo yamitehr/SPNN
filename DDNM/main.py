@@ -66,6 +66,21 @@ def parse_args_and_config():
     parser.add_argument(
         "--nlbp_stop_cond", type=float, default=0.11, help="Skip back-projection when attribute error is below this threshold"
     )
+    parser.add_argument(
+        "--guidance_method", type=str, default="nlbp", choices=["nlbp", "dps"],
+        help="Guidance method: 'nlbp' (Non-Linear Back-Projection) or 'dps' (Diffusion Posterior Sampling)"
+    )
+    parser.add_argument(
+        "--dps_step_size", type=float, default=0.5, help="Step size (zeta) for DPS gradient guidance"
+    )
+    parser.add_argument(
+        "--classifier", type=str, default="spnn", choices=["spnn", "resnet"],
+        help="Classifier to use: 'spnn' (SPNN pseudo-invertible) or 'resnet' (vanilla ResNet-50 baseline)"
+    )
+    parser.add_argument(
+        "--resnet_ckpt", type=str, default=None,
+        help="Path to ResNet-50 checkpoint (required when --classifier resnet)"
+    )
 
     args = parser.parse_args()
 

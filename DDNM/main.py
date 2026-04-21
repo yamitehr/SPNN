@@ -67,11 +67,14 @@ def parse_args_and_config():
         "--nlbp_stop_cond", type=float, default=0.11, help="Skip back-projection when attribute error is below this threshold"
     )
     parser.add_argument(
-        "--guidance_method", type=str, default="nlbp", choices=["nlbp", "dps"],
-        help="Guidance method: 'nlbp' (Non-Linear Back-Projection) or 'dps' (Diffusion Posterior Sampling)"
+        "--guidance_method", type=str, default="nlbp", choices=["nlbp", "dps", "cg", "true_cg"],
+        help="Guidance method: 'nlbp' (NLBP), 'dps' (DPS), 'cg' (CG with Tweedie), 'true_cg' (CG with noise-aware classifier)"
     )
     parser.add_argument(
         "--dps_step_size", type=float, default=0.5, help="Step size (zeta) for DPS gradient guidance"
+    )
+    parser.add_argument(
+        "--cg_scale", type=float, default=1.0, help="Scale factor (s) for classifier guidance"
     )
     parser.add_argument(
         "--classifier", type=str, default="spnn", choices=["spnn", "resnet"],
@@ -80,6 +83,22 @@ def parse_args_and_config():
     parser.add_argument(
         "--resnet_ckpt", type=str, default=None,
         help="Path to ResNet-50 checkpoint (required when --classifier resnet)"
+    )
+    parser.add_argument(
+        "--noisy_resnet_ckpt", type=str, default=None,
+        help="Path to noise-aware ResNet-50 checkpoint (required for --guidance_method true_cg)"
+    )
+    parser.add_argument(
+        "--spnn_ckpt", type=str, default=None,
+        help="Path to local SPNN checkpoint (if omitted, downloads from HuggingFace)"
+    )
+    parser.add_argument(
+        "--sampling_steps", type=int, default=None,
+        help="Override T_sampling from config (e.g., 1000 for full DDPM schedule)"
+    )
+    parser.add_argument(
+        "--sampler", type=str, default="ddim", choices=["ddim", "ddpm"],
+        help="Sampler style: 'ddim' (current, DDIM-style step) or 'ddpm' (standard DDPM posterior, as in DPS paper)"
     )
 
     args = parser.parse_args()
@@ -155,6 +174,10 @@ def dict2namespace(config):
 
 def main():
     args, config = parse_args_and_config()
+
+    if args.sampling_steps is not None:
+        print(f"Overriding T_sampling: {config.time_travel.T_sampling} -> {args.sampling_steps}")
+        config.time_travel.T_sampling = args.sampling_steps
 
     try:
         runner = Diffusion(args, config)

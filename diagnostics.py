@@ -11,9 +11,9 @@ class PenroseChecker:
         self.logger = logger
 
     @torch.no_grad()
-    def run_penrose_batched(self, checkpoint_path, test_loader, device, img_ch, num_classes, hidden, scale_bound, img_size):
+    def run_penrose_batched(self, checkpoint_path, test_loader, device, img_ch, num_classes, hidden, scale_bound, img_size, mix_type="cayley"):
         """Tests the Penrose and specific inverse identities."""
-        net = SPNN(img_ch=img_ch, num_classes=num_classes, hidden=hidden, scale_bound=scale_bound, img_size=img_size).to(device)
+        net = SPNN(img_ch=img_ch, num_classes=num_classes, hidden=hidden, scale_bound=scale_bound, img_size=img_size, mix_type=mix_type).to(device)
         state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
         net.load_state_dict(state_dict)
         net.eval()

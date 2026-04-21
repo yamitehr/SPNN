@@ -47,6 +47,7 @@ def main():
     parser.add_argument('--mix_type', type=str, default='cayley', choices=['cayley', 'householder'])
     parser.add_argument('--is_r_opt', action="store_true")
     parser.add_argument('--is_forward_train', action="store_true")
+    parser.add_argument('--skip_diagnostics', action="store_true", help="Skip Penrose/Ginv diagnostics, run r-opt only")
     args = parser.parse_args()
 
     if args.checkpoint_dir is None:
@@ -117,22 +118,23 @@ def main():
 
     ckpt_path = os.path.join(args.checkpoint_dir, "best_model.pth")
     if os.path.exists(ckpt_path):
-        penrose_before = penrose_checker.run_penrose_batched(
-            checkpoint_path=ckpt_path, test_loader=test_loader,
-            device=torch.device(device), img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type)
+        if not args.skip_diagnostics:
+            penrose_before = penrose_checker.run_penrose_batched(
+                checkpoint_path=ckpt_path, test_loader=test_loader,
+                device=torch.device(device), img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type)
 
-        ginv_real_before = ginv_calculator.run(
-            checkpoint_path=ckpt_path,
-            loader=test_loader,
-            device=torch.device(device),
-            model_cls=SPNN,
-            model_kwargs=dict(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type),
-        )
+            ginv_real_before = ginv_calculator.run(
+                checkpoint_path=ckpt_path,
+                loader=test_loader,
+                device=torch.device(device),
+                model_cls=SPNN,
+                model_kwargs=dict(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type),
+            )
 
-        print("[Before r-opt] Penrose metrics:")
-        for k, v in penrose_before.items():
-            print(f"  penrose_before_r_opt/{k}: {v}")
-        print(f"  test/g'(y)_norm_before_r_opt: {float(ginv_real_before)}")
+            print("[Before r-opt] Penrose metrics:")
+            for k, v in penrose_before.items():
+                print(f"  penrose_before_r_opt/{k}: {v}")
+            print(f"  test/g'(y)_norm_before_r_opt: {float(ginv_real_before)}")
 
         if args.is_r_opt:
             trainer.train_r_opt_on_real_logits(
@@ -145,22 +147,23 @@ def main():
                 mix_type=args.mix_type,
             )
 
-            penrose_after = penrose_checker.run_penrose_batched(
-                checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"), test_loader=test_loader,
-                device=torch.device(device), img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type)
+            if not args.skip_diagnostics:
+                penrose_after = penrose_checker.run_penrose_batched(
+                    checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"), test_loader=test_loader,
+                    device=torch.device(device), img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type)
 
-            ginv_real_after = ginv_calculator.run(
-                checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"),
-                loader=test_loader,
-                device=torch.device(device),
-                model_cls=SPNN,
-                model_kwargs=dict(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type),
-            )
+                ginv_real_after = ginv_calculator.run(
+                    checkpoint_path=os.path.join(args.checkpoint_dir, "best_model_r_opt_real.pth"),
+                    loader=test_loader,
+                    device=torch.device(device),
+                    model_cls=SPNN,
+                    model_kwargs=dict(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=args.img_size, mix_type=args.mix_type),
+                )
 
-            print("[After r-opt] Penrose metrics:")
-            for k, v in penrose_after.items():
-                print(f"  penrose_after_r_opt/{k}: {v}")
-            print(f"  test/g'(y)_norm_after_r_opt: {float(ginv_real_after)}")
+                print("[After r-opt] Penrose metrics:")
+                for k, v in penrose_after.items():
+                    print(f"  penrose_after_r_opt/{k}: {v}")
+                print(f"  test/g'(y)_norm_after_r_opt: {float(ginv_real_after)}")
     else:
         print(f"No checkpoint found at {ckpt_path}, skipping diagnostics.")
 

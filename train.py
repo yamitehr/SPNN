@@ -279,6 +279,9 @@ class CelebATrainer:
 
         for ep in range(epochs):
             total_loss = 0.0
+            total_G_pinv = 0.0
+            total_img_rec = 0.0
+            total_cycle = 0.0
             steps = 0
             for x_batch, _ in loader:
                 x_batch = x_batch.to(device, non_blocking=True)
@@ -323,9 +326,17 @@ class CelebATrainer:
                 opt.step()
 
                 total_loss += loss.item()
+                total_G_pinv += loss_G_pinv.item()
+                total_img_rec += img_rec_l.item()
+                total_cycle += cycle_l.item()
                 steps += 1
 
-            print(f"[r-opt-real] Epoch {ep + 1:3d} / {epochs}: avg_loss={total_loss / max(1, steps):.6f}")
+            n = max(1, steps)
+            print(f"[r-opt-real] Epoch {ep + 1:3d} / {epochs}: "
+                  f"loss={total_loss/n:.6f}  "
+                  f"G_pinv={total_G_pinv/n:.6f} (x{self.args.lambda_r_norm})  "
+                  f"img_rec={total_img_rec/n:.6f} (x{self.args.lambda_r_rec})  "
+                  f"cycle={total_cycle/n:.6f} (x{self.args.lambda_r_cycle})  ")
 
             if (ep + 1) % 10 == 0:
                 checkpoint_path = os.path.join(self.args.checkpoint_dir, f"r_opt_epoch_{ep + 1}.pth")

@@ -1,8 +1,8 @@
 """
-Detection trainer for SPNN on Pascal VOC.
+Detection trainer for SPNN on Pascal VOC using HuggingFace Accelerate for multi-GPU.
 
 Combines YOLOv1 detection loss with SPNN cycle losses (right-inverse + image reconstruction).
-Follows the same two-stage training as CelebATrainer:
+Two-stage training:
   Stage 1: Forward training (detection + cycle losses)
   Stage 2: r-network optimization
 
@@ -18,38 +18,48 @@ from yolov1.loss import YoloLoss
 from yolov1.utils import get_bboxes, mean_average_precision
 from pytorch_optimization import get_linear_schedule_with_warmup
 
-# Detection config: S=8 (required by PixelUnshuffle), B=2 (original YOLOv1), C=20 (VOC)
+# Detection config
 S = 8
 B = 2
 C = 20
 OUT_CH = C + B * 5  # 30
 
 
-def _wandb_log(args, data, step=None):
-    if getattr(args, "use_wandb", False):
-        import wandb
-        wandb.log(data, step=step)
-
-
 class DetectionTrainer:
-    def __init__(self, args, model, train_loader, val_loader, device, logger, n_gpu):
+    def __init__(self, args, model, train_loader, val_loader, accelerator, logger):
         self.args = args
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.device = device
+        self.accelerator = accelerator
+        self.device = accelerator.device
         self.logger = logger
-        self.n_gpu = n_gpu
+        self.is_main = accelerator.is_main_process
+
+    def _log(self, msg):
+        if self.is_main:
+            self.logger.info(msg)
+
+    def _wandb_log(self, data, step=None):
+        if self.is_main and getattr(self.args, "use_wandb", False):
+            import wandb
+            wandb.log(data, step=step)
 
     def train(self):
-        self.logger.info(f'Loss Weights: det={self.args.lambda_det}, '
-                         f'cycle={self.args.lambda_right_inverse}, rec={self.args.lambda_img_rec}')
+        self._log(f'Loss Weights: det={self.args.lambda_det}, '
+                  f'cycle={self.args.lambda_right_inverse}, rec={self.args.lambda_img_rec}')
 
         optimizer = torch.optim.Adam(
             self.model.parameters(), lr=self.args.lr,
             betas=(self.args.beta1, self.args.beta2)
         )
-        total_steps = int(self.args.epoch * len(self.train_loader) / max(1, self.n_gpu))
+
+        # Accelerate prepare: wraps model with DDP, splits dataloader
+        self.model, optimizer, self.train_loader = self.accelerator.prepare(
+            self.model, optimizer, self.train_loader
+        )
+
+        total_steps = self.args.epoch * len(self.train_loader)
         scheduler = get_linear_schedule_with_warmup(
             optimizer,
             num_warmup_steps=self.args.warmup_iters,
@@ -63,45 +73,44 @@ class DetectionTrainer:
         self.model.train()
         best_val_loss = float("inf")
 
-        self.logger.info(f'Start training for {self.args.epoch} epochs, S={S}, B={B}, C={C}')
+        self._log(f'Start training for {self.args.epoch} epochs, S={S}, B={B}, C={C}')
 
         for epoch in range(self.args.epoch):
             show_loss = 0
             show_det_loss = 0
             show_cycle_loss = 0
             show_img_rec_loss = 0
-            n_steps_epoch = 0
 
-            for train_img, train_labels in tqdm(self.train_loader, desc=f"Epoch {epoch+1}"):
-                train_img = train_img.to(device=self.device, non_blocking=True)
-                train_labels = train_labels.to(device=self.device, dtype=torch.float32, non_blocking=True)
+            pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}",
+                        disable=not self.is_main)
+
+            for train_img, train_labels in pbar:
+                train_img = train_img.to(self.device, non_blocking=True)
+                train_labels = train_labels.to(self.device, dtype=torch.float32, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
 
-                # Forward: SPNN outputs [B, 30, 8, 8]
+                # Forward through DDP-wrapped model: [B, 30, 8, 8]
                 output = self.model(train_img)
 
-                # YoloLoss expects [batch, S*S*(C+B*5)] — flatten spatial dims
-                # YoloLoss uses reduction="sum", so normalize by batch size
-                # to match the mean-reduced cycle losses
+                # YoloLoss: flatten to [batch, S*S*30], normalize by batch
                 output_flat = output.permute(0, 2, 3, 1).reshape(output.shape[0], -1)
                 loss_det = yolo_loss_fn(output_flat, train_labels) / train_img.shape[0]
 
-                # Right-inverse loss: || g(g'(y)) - y ||²
-                model_ref = self.model.module if hasattr(self.model, "module") else self.model
-                x_inv = model_ref.pinv(output)
+                # Cycle losses use unwrapped model for pinv
+                unwrapped = self.accelerator.unwrap_model(self.model)
+                x_inv = unwrapped.pinv(output)
                 y_cycle = self.model(x_inv)
                 cycle_l = (y_cycle - output).pow(2).mean()
 
-                # Image reconstruction loss: || g'(g(x)) - x ||²
                 img_rec_l = (x_inv - train_img).pow(2).mean()
 
                 loss = (self.args.lambda_det * loss_det
                         + self.args.lambda_right_inverse * cycle_l
                         + self.args.lambda_img_rec * img_rec_l)
 
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_norm)
+                self.accelerator.backward(loss)
+                self.accelerator.clip_grad_norm_(self.model.parameters(), self.args.clip_norm)
                 optimizer.step()
                 scheduler.step()
 
@@ -109,7 +118,6 @@ class DetectionTrainer:
                 show_det_loss += loss_det.detach().item()
                 show_cycle_loss += cycle_l.detach().item()
                 show_img_rec_loss += img_rec_l.detach().item()
-                n_steps_epoch += 1
                 current_step += 1
 
                 if current_step % self.args.print_freq == 0:
@@ -120,13 +128,13 @@ class DetectionTrainer:
                     avg_rec = show_img_rec_loss / n
                     lr = scheduler.get_lr()[0]
 
-                    self.logger.info(
+                    self._log(
                         f'[epoch:{epoch+1}/{self.args.epoch}, step:{current_step}, '
                         f'lr:{lr:.3e}] '
                         f'loss:{avg_loss:.4f} det:{avg_det:.4f} '
                         f'cycle:{avg_cycle:.6f} rec:{avg_rec:.6f}'
                     )
-                    _wandb_log(self.args, {
+                    self._wandb_log({
                         "train/loss": avg_loss,
                         "train/det_loss": avg_det,
                         "train/cycle_loss": avg_cycle,
@@ -136,7 +144,7 @@ class DetectionTrainer:
 
                     show_loss = show_det_loss = show_cycle_loss = show_img_rec_loss = 0
 
-            # End-of-epoch validation
+            # End-of-epoch validation (all ranks compute, only main logs)
             self.model.eval()
             val_loss_sum = 0.0
             val_det_sum = 0.0
@@ -153,8 +161,8 @@ class DetectionTrainer:
                     output_flat = output.permute(0, 2, 3, 1).reshape(output.shape[0], -1)
                     loss_det = yolo_loss_fn(output_flat, val_labels) / val_img.shape[0]
 
-                    model_ref = self.model.module if hasattr(self.model, "module") else self.model
-                    x_inv = model_ref.pinv(output)
+                    unwrapped = self.accelerator.unwrap_model(self.model)
+                    x_inv = unwrapped.pinv(output)
                     y_cycle = self.model(x_inv)
                     cycle_l = (y_cycle - output).pow(2).mean()
                     img_rec_l = (x_inv - val_img).pow(2).mean()
@@ -172,22 +180,27 @@ class DetectionTrainer:
             avg_val_det = val_det_sum / max(1, val_batches)
             avg_val_cycle = val_cycle_sum / max(1, val_batches)
             avg_val_rec = val_rec_sum / max(1, val_batches)
-            self.logger.info(f'[epoch:{epoch+1} end] val_loss:{avg_val_loss:.5f}')
+            self._log(f'[epoch:{epoch+1} end] val_loss:{avg_val_loss:.5f}')
 
-            # Compute mAP using repo's get_bboxes + mean_average_precision
-            pred_boxes, target_boxes = get_bboxes(
-                self.val_loader, self.model,
-                iou_threshold=0.5, threshold=0.4,
-                device=self.device, S=S,
-            )
-            map_val = mean_average_precision(
-                pred_boxes, target_boxes,
-                iou_threshold=0.5, box_format="midpoint",
-                num_classes=C,
-            )
-            self.logger.info(f'[epoch:{epoch+1}] val mAP@0.5: {map_val:.4f}')
+            # mAP (main process only, uses unwrapped model, every eval_freq epochs)
+            eval_freq = getattr(self.args, 'eval_freq', 1)
+            if self.is_main and (epoch + 1) % eval_freq == 0:
+                unwrapped = self.accelerator.unwrap_model(self.model)
+                pred_boxes, target_boxes = get_bboxes(
+                    self.val_loader, unwrapped,
+                    iou_threshold=0.5, threshold=0.4,
+                    device=self.device, S=S,
+                )
+                map_val = mean_average_precision(
+                    pred_boxes, target_boxes,
+                    iou_threshold=0.5, box_format="midpoint",
+                    num_classes=C,
+                )
+                self._log(f'[epoch:{epoch+1}] val mAP@0.5: {map_val:.4f}')
+            else:
+                map_val = 0.0
 
-            _wandb_log(self.args, {
+            self._wandb_log({
                 "val/loss": avg_val_loss,
                 "val/det_loss": avg_val_det,
                 "val/cycle_loss": avg_val_cycle,
@@ -198,17 +211,19 @@ class DetectionTrainer:
 
             if avg_val_loss < best_val_loss:
                 best_val_loss = avg_val_loss
-                self.logger.info(f'[BEST] epoch:{epoch+1} val_loss:{best_val_loss:.5f} mAP:{map_val:.4f}')
-                model_to_save = self.model.module if hasattr(self.model, 'module') else self.model
-                torch.save(model_to_save.state_dict(), os.path.join(self.args.checkpoint_dir, 'best_model.pth'))
+                self._log(f'[BEST] epoch:{epoch+1} val_loss:{best_val_loss:.5f} mAP:{map_val:.4f}')
+                if self.is_main:
+                    unwrapped = self.accelerator.unwrap_model(self.model)
+                    torch.save(unwrapped.state_dict(),
+                               os.path.join(self.args.checkpoint_dir, 'best_model.pth'))
 
             self.model.train()
 
-        self.logger.info('End of forward training.')
+        self._log('End of forward training.')
         return self.model
 
     def _train_r_opt(self, model, loader, device, epochs, lr):
-        """Train only r-networks in ConvPINNBlocks. Shape-agnostic — works for any output."""
+        """Train only r-networks. Runs on single GPU (no DDP needed for r-opt)."""
         for p in model.parameters():
             p.requires_grad = False
 
@@ -284,7 +299,7 @@ class DetectionTrainer:
                   f"loss={avg_loss:.6f} g_pinv={avg_g_pinv:.6f} "
                   f"rec={avg_rec:.6f} cycle={avg_cycle:.6f}")
 
-            _wandb_log(self.args, {
+            self._wandb_log({
                 "r_opt/loss": avg_loss,
                 "r_opt/g_pinv_loss": avg_g_pinv,
                 "r_opt/img_rec_loss": avg_rec,
@@ -300,7 +315,7 @@ class DetectionTrainer:
         model.eval()
 
     def train_r_opt(self, checkpoint_path, device, loader, epochs, lr, out_checkpoint_path):
-        """Load a forward-trained model and run r-optimization."""
+        """Load a forward-trained model and run r-optimization (single GPU)."""
         model = self._build_model().to(device)
         state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
@@ -316,19 +331,26 @@ class DetectionTrainer:
         return out_checkpoint_path
 
     def _build_model(self):
-        """Build a detection SPNN model matching self.args config."""
+        """Build a detection SPNN model matching self.args config (deeper backbone)."""
         from models import PixelUnshuffleBlock
         mix_type = getattr(self.args, "mix_type", "cayley")
+        hidden = 256
 
         layer_channels = [
+            # Backbone (shared with classification)
             (PixelUnshuffleBlock, {"r": 4}),
-            (ConvPINNBlock, {"in_ch": 48, "out_ch": 12, "hidden": 128,
+            (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
+                             "scale_bound": 2.0, "feat_size": 64, "mix_type": mix_type}),
+            (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
                              "scale_bound": 2.0, "feat_size": 64, "mix_type": mix_type}),
             (PixelUnshuffleBlock, {"r": 4}),
-            (ConvPINNBlock, {"in_ch": 192, "out_ch": 48, "hidden": 128,
+            (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
                              "scale_bound": 2.0, "feat_size": 16, "mix_type": mix_type}),
+            (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
+                             "scale_bound": 2.0, "feat_size": 16, "mix_type": mix_type}),
+            # Detection head
             (PixelUnshuffleBlock, {"r": 2}),
-            (ConvPINNBlock, {"in_ch": 192, "out_ch": OUT_CH, "hidden": 256,
+            (ConvPINNBlock, {"in_ch": 192, "out_ch": OUT_CH, "hidden": hidden,
                              "scale_bound": 2.0, "feat_size": S, "mix_type": mix_type}),
         ]
 

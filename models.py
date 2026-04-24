@@ -42,24 +42,19 @@ class Cayley1x1Conv(BaseOrthogonal1x1Conv):
     - Apply W as a 1x1 convolution across channels
     - Inverse uses W^T (since W is orthogonal)
     """
-    def __init__(self, channels, eps=1e-6):
+    def __init__(self, channels, eps=1e-4):
         super().__init__(channels)
         self.eps = eps
 
-        B = torch.zeros(channels, channels)
-        self.A_unconstrained = nn.Parameter(B)
+        self.A_unconstrained = nn.Parameter(torch.zeros(channels, channels))
 
     def _compute_W(self, device, dtype):
         C = self.channels
-        B = self.A_unconstrained.to(device=device, dtype=dtype)
-
-        # skew-symmetric
+        B = self.A_unconstrained.to(device=device, dtype=torch.float32)
         A = B - B.t()
-
-        I = torch.eye(C, device=device, dtype=dtype)
-        # Cayley transform: (I + A) W = (I - A)
-        W = torch.linalg.solve(I + A + self.eps * I, I - A)
-        return W  # [C, C]
+        I = torch.eye(C, device=device, dtype=torch.float32)
+        W = torch.linalg.solve((1 + self.eps) * I + A, I - A)
+        return W.to(dtype=dtype)  # [C, C]
 
 class Householder1x1Conv(BaseOrthogonal1x1Conv):
     """
@@ -79,19 +74,15 @@ class Householder1x1Conv(BaseOrthogonal1x1Conv):
 
     def _compute_W(self, device, dtype):
         C = self.channels
-
         if self.V is None or self.num_reflections == 0:
             return torch.eye(C, device=device, dtype=dtype)
-
         W = torch.eye(C, device=device, dtype=dtype)
         V = self.V.to(device=device, dtype=dtype)
-
         for i in range(self.num_reflections):
             v = V[i]
             v = v / (v.norm(p=2) + self.eps)
             H = torch.eye(C, device=device, dtype=dtype) - 2.0 * torch.outer(v, v)
             W = H @ W
-
         return W
 
 class BasePatchOrthogonalMix(nn.Module):
@@ -172,25 +163,19 @@ class BasePatchOrthogonalMix(nn.Module):
         return y
 
 class PatchCayleyMix(BasePatchOrthogonalMix):
-    def __init__(self, in_ch, patch_size=4, eps=1e-6):
+    def __init__(self, in_ch, patch_size=4, eps=1e-4):
         super().__init__(in_ch, patch_size)
         self.eps = eps
 
-        # learn unconstrained parameter B ∈ R^{D×D}
-        B = torch.zeros(self.D, self.D)
-        self.B = nn.Parameter(B)
+        self.B = nn.Parameter(torch.zeros(self.D, self.D))
 
     def _compute_W(self, device, dtype):
-        B = self.B.to(device=device, dtype=dtype)
-
-        # skew-symmetric A = B - B^T
+        D = self.D
+        B = self.B.to(device=device, dtype=torch.float32)
         A = B - B.t()
-
-        I = torch.eye(self.D, device=device, dtype=dtype)
-
-        # Cayley transform: W = (I - A)(I + A)^{-1}
-        W = torch.linalg.solve(I + A + self.eps * I, I - A)
-        return W  # [D, D]
+        I = torch.eye(D, device=device, dtype=torch.float32)
+        W = torch.linalg.solve((1 + self.eps) * I + A, I - A)
+        return W.to(dtype=dtype)  # [D, D]
 
 
 class PatchHouseholderMix(BasePatchOrthogonalMix):
@@ -209,18 +194,16 @@ class PatchHouseholderMix(BasePatchOrthogonalMix):
             self.register_parameter("V", None)
 
     def _compute_W(self, device, dtype):
+        D = self.D
         if self.V is None or self.num_reflections == 0:
-            return torch.eye(self.D, device=device, dtype=dtype)
-
-        W = torch.eye(self.D, device=device, dtype=dtype)
+            return torch.eye(D, device=device, dtype=dtype)
+        W = torch.eye(D, device=device, dtype=dtype)
         V = self.V.to(device=device, dtype=dtype)
-
         for i in range(self.num_reflections):
             v = V[i]
             v = v / (v.norm(p=2) + self.eps)
-            H = torch.eye(self.D, device=device, dtype=dtype) - 2.0 * torch.outer(v, v)
+            H = torch.eye(D, device=device, dtype=dtype) - 2.0 * torch.outer(v, v)
             W = H @ W
-
         return W  # [D, D]
 
 
@@ -531,7 +514,44 @@ class PINN(nn.Module):
     def __init__(self, block_cls, layer_channels, img_size: int = 64, num_classes=40, mix_type: str = "cayley", **block_kwargs):
         super().__init__()
 
-        if img_size == 64:
+        if layer_channels is not None:
+            # DIY network: build blocks from user-provided block_cls and layer_channels.
+            # Checked first so that layer_channels always overrides built-in architectures.
+            #
+            # Each entry in layer_channels must be one of:
+            #   (BlockClass, kwargs_dict)  – per-block class + constructor kwargs
+            #   kwargs_dict                – constructor kwargs using the shared block_cls
+            #
+            # Example:
+            #   layer_channels = [
+            #       (PixelUnshuffleBlock, {"r": 4}),                              # [3,H,W] -> [48,H/4,W/4]
+            #       (ConvPINNBlock, {"in_ch": 48, "out_ch": 12, "hidden": 128, "scale_bound": 2.0}),
+            #       (ConvPINNBlock, {"in_ch": 12, "out_ch": num_classes, "hidden": 128, "scale_bound": 2.0}),
+            #   ]
+            if not layer_channels:
+                raise ValueError("layer_channels must be a non-empty list for custom architectures")
+
+            blocks = []
+            for spec in layer_channels:
+                if isinstance(spec, (list, tuple)) and len(spec) == 2 and isinstance(spec[1], dict):
+                    cls, kwargs = spec
+                elif isinstance(spec, dict):
+                    if block_cls is None:
+                        raise ValueError(
+                            "block_cls must be provided when layer_channels entries are plain dicts"
+                        )
+                    cls, kwargs = block_cls, spec
+                else:
+                    raise ValueError(
+                        f"Each layer_channels entry must be a (BlockClass, kwargs_dict) tuple "
+                        f"or a kwargs dict (with block_cls set), got {type(spec)}"
+                    )
+                # block_kwargs are shared defaults; per-block kwargs take priority
+                merged = {**block_kwargs, **kwargs}
+                blocks.append(cls(**merged))
+            self.blocks = nn.ModuleList(blocks)
+
+        elif img_size == 64:
             self.blocks = nn.ModuleList([
                 PixelUnshuffleBlock(2),              # [3,64,64] -> [12,32,32]
                 ConvPINNBlock(12, 6, hidden=128, scale_bound=2.0, mix_type=mix_type),
@@ -571,42 +591,11 @@ class PINN(nn.Module):
 
                 ConvPINNBlock(1024, num_classes, hidden=128, scale_bound=2.0, mix_type=mix_type),
             ])
-
         else:
-            # DIY network: build blocks from user-provided block_cls and layer_channels.
-            #
-            # Each entry in layer_channels must be one of:
-            #   (BlockClass, kwargs_dict)  – per-block class + constructor kwargs
-            #   kwargs_dict                – constructor kwargs using the shared block_cls
-            #
-            # Example:
-            #   layer_channels = [
-            #       (PixelUnshuffleBlock, {"r": 4}),                              # [3,H,W] -> [48,H/4,W/4]
-            #       (ConvPINNBlock, {"in_ch": 48, "out_ch": 12, "hidden": 128, "scale_bound": 2.0}),
-            #       (ConvPINNBlock, {"in_ch": 12, "out_ch": num_classes, "hidden": 128, "scale_bound": 2.0}),
-            #   ]
-            if not layer_channels:
-                raise ValueError("layer_channels must be a non-empty list for custom architectures")
-
-            blocks = []
-            for spec in layer_channels:
-                if isinstance(spec, (list, tuple)) and len(spec) == 2 and isinstance(spec[1], dict):
-                    cls, kwargs = spec
-                elif isinstance(spec, dict):
-                    if block_cls is None:
-                        raise ValueError(
-                            "block_cls must be provided when layer_channels entries are plain dicts"
-                        )
-                    cls, kwargs = block_cls, spec
-                else:
-                    raise ValueError(
-                        f"Each layer_channels entry must be a (BlockClass, kwargs_dict) tuple "
-                        f"or a kwargs dict (with block_cls set), got {type(spec)}"
-                    )
-                # block_kwargs are shared defaults; per-block kwargs take priority
-                merged = {**block_kwargs, **kwargs}
-                blocks.append(cls(**merged))
-            self.blocks = nn.ModuleList(blocks)
+            raise ValueError(
+                f"img_size must be 32, 64 or 256 for built-in architectures (got {img_size}). "
+                "To use a custom size, pass your own block definitions via layer_channels."
+            )
 
     def forward(self, x, return_latents=False):
         latents = []
@@ -679,6 +668,7 @@ class SPNN(nn.Module):
         mix_type: str = "cayley",
         block_cls=None,
         layer_channels=None,
+        output_spatial_size=None,
         **block_kwargs,
     ):
         super().__init__()
@@ -687,12 +677,14 @@ class SPNN(nn.Module):
                 f"img_size must be 32, 64 or 256 for built-in architectures (got {img_size}). "
                 "To use a custom size, pass your own block definitions via layer_channels."
             )
-        assert num_classes < 1024, "num of classes (output size) must be less then 1024"
+        if output_spatial_size is None:
+            assert num_classes < 1024, "num of classes (output size) must be less then 1024"
         self.img_ch = img_ch
         self.num_classes = num_classes
         self.hidden = hidden
         self.scale_bound = scale_bound
         self.img_size = img_size
+        self.output_spatial_size = output_spatial_size
 
         self.pinn = PINN(block_cls=block_cls, layer_channels=layer_channels, img_size=img_size, mix_type=mix_type, **block_kwargs)
 
@@ -706,15 +698,20 @@ class SPNN(nn.Module):
         else:
             y_map = out
 
-        logits = y_map.view(B, self.num_classes)
+        if self.output_spatial_size is None:
+            logits = y_map.view(B, self.num_classes)
+        else:
+            logits = y_map
 
         return (logits, latents) if return_latents else logits
 
     def pinv(self, logits, latents=None):
-        B, C = logits.shape
-        assert C == self.num_classes
-
-        y_map_hat = logits.view(B, self.num_classes, 1, 1)
+        if self.output_spatial_size is None:
+            B, C = logits.shape
+            assert C == self.num_classes
+            y_map_hat = logits.view(B, self.num_classes, 1, 1)
+        else:
+            y_map_hat = logits
 
         return self.pinn.pinv(y_map_hat, latents=latents)
 

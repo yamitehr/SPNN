@@ -90,8 +90,8 @@ parser.add_argument('-a', '--arch', metavar='ARCH', default='resnet18',
                     help='model architecture: ' +
                         ' | '.join(model_names) +
                         ' (default: resnet18)')
-parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
-                    help='number of data loading workers (default: 4)')
+parser.add_argument('-j', '--workers', default=8, type=int, metavar='N',
+                    help='number of data loading workers (default: 8)')
 parser.add_argument('--epochs', default=90, type=int, metavar='N',
                     help='number of total epochs to run')
 parser.add_argument('--start-epoch', default=0, type=int, metavar='N',
@@ -144,6 +144,10 @@ parser.add_argument('--lambda-cycle', default=1.0, type=float,
                     help='weight for SPNN right-inverse cycle loss (default: 1.0)')
 parser.add_argument('--lambda-rec', default=1.0, type=float,
                     help='weight for SPNN image reconstruction loss (default: 1.0)')
+parser.add_argument('--scheduler', default='step', type=str, choices=['step', 'cosine'],
+                    help='LR scheduler type (default: step)')
+parser.add_argument('--warmup-epochs', default=0, type=int,
+                    help='number of warmup epochs (default: 0, used with cosine scheduler)')
 parser.add_argument('--wandb', action='store_true', help='enable wandb logging')
 parser.add_argument('--wandb-project', default='spnn-imagenet', type=str)
 parser.add_argument('--wandb-run-name', default=None, type=str)
@@ -238,6 +242,8 @@ def main_worker(gpu, ngpus_per_node, args):
         import wandb
         wandb.init(project=args.wandb_project, name=args.wandb_run_name,
                    config=vars(args))
+        # Log gradient norms and parameter norms every 100 steps
+        wandb.watch(model, log="gradients", log_freq=100, log_graph=False)
     args.is_main = is_main
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
@@ -272,9 +278,9 @@ def main_worker(gpu, ngpus_per_node, args):
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
     
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
-    
+    # Scheduler is created after data loaders (cosine needs len(train_loader))
+    scheduler = None  # placeholder, created below
+
     # optionally resume from a checkpoint
     if args.resume:
         if os.path.isfile(args.resume):
@@ -293,7 +299,8 @@ def main_worker(gpu, ngpus_per_node, args):
             unwrapped = model.module if hasattr(model, 'module') else model
             unwrapped.load_state_dict(checkpoint['state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer'])
-            scheduler.load_state_dict(checkpoint['scheduler'])
+            # Scheduler state loaded after scheduler creation below
+            args._scheduler_state = checkpoint.get('scheduler', None)
             print("=> loaded checkpoint '{}' (epoch {})"
                   .format(args.resume, checkpoint['epoch']))
         else:
@@ -344,6 +351,24 @@ def main_worker(gpu, ngpus_per_node, args):
         val_dataset, batch_size=args.batch_size, shuffle=False,
         num_workers=args.workers, pin_memory=True, sampler=val_sampler)
 
+    # Create scheduler (needs len(train_loader))
+    if args.scheduler == 'cosine':
+        from pytorch_optimization import get_cosine_schedule_with_warmup
+        num_training_steps = len(train_loader) * args.epochs
+        num_warmup_steps = len(train_loader) * args.warmup_epochs
+        scheduler = get_cosine_schedule_with_warmup(
+            optimizer, num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps)
+    else:
+        scheduler = StepLR(optimizer, step_size=30, gamma=0.1)
+
+    # Load scheduler state if resuming
+    if hasattr(args, '_scheduler_state') and args._scheduler_state is not None:
+        try:
+            scheduler.load_state_dict(args._scheduler_state)
+        except Exception as e:
+            print(f"Warning: Could not load scheduler state ({e}), starting fresh scheduler")
+
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
@@ -353,16 +378,69 @@ def main_worker(gpu, ngpus_per_node, args):
             train_sampler.set_epoch(epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch, device, args)
+        train(train_loader, model, criterion, optimizer, epoch, device, args,
+              scheduler if args.scheduler == 'cosine' else None)
 
         # evaluate on validation set
         acc1 = validate(val_loader, model, criterion, args)
 
-        scheduler.step()
+        if args.scheduler == 'step':
+            scheduler.step()
 
         # remember best acc@1 and save checkpoint
         is_best = acc1 > best_acc1
         best_acc1 = max(acc1, best_acc1)
+
+        # Penrose identity check every 5 epochs (main process only)
+        penrose_freq = 5
+        if args.is_main and (epoch + 1) % penrose_freq == 0:
+            spnn_model = model.module if hasattr(model, 'module') else model
+            spnn_model.eval()
+            p1_sum, p2_sum, p3_sum, n_batches = 0.0, 0.0, 0.0, 0
+            max_penrose_batches = 160  # ~10K images at batch=64
+            with torch.no_grad():
+                for val_imgs, _ in val_loader:
+                    if n_batches >= max_penrose_batches:
+                        break
+                    val_imgs = val_imgs.to(device, non_blocking=True)
+
+                    # Use real model outputs y = g(x) for all identities
+                    y_g = spnn_model(val_imgs)
+
+                    # 1. g(g'(g(x))) == g(x)
+                    y_ggg = spnn_model(spnn_model.pinv(y_g))
+                    p1_sum += (y_ggg - y_g).pow(2).mean().item()
+
+                    # 2. g'(g(g'(y))) == g'(y)  [using y = g(x)]
+                    x_gp = spnn_model.pinv(y_g)
+                    x_gpgp = spnn_model.pinv(spnn_model(x_gp))
+                    p2_sum += (x_gpgp - x_gp).pow(2).mean().item()
+
+                    # 3. g(g'(y)) == y  [using y = g(x)]
+                    y_cycle = spnn_model(spnn_model.pinv(y_g))
+                    p3_sum += (y_cycle - y_g).pow(2).mean().item()
+
+                    n_batches += 1
+
+            p1 = p1_sum / max(1, n_batches)
+            p2 = p2_sum / max(1, n_batches)
+            p3 = p3_sum / max(1, n_batches)
+
+            print(f"\n--- Penrose Check (epoch {epoch+1}, {n_batches} batches) ---")
+            print(f"  g(g'(g(x)))=g(x)  MSE: {p1:.2e}")
+            print(f"  g'(g(g'(y)))=g'(y) MSE: {p2:.2e}")
+            print(f"  g(g'(y))=y         MSE: {p3:.2e}")
+            print("--------------------------------------")
+
+            if args.wandb:
+                import wandb
+                wandb.log({
+                    "penrose/ggg_mse": p1,
+                    "penrose/gpgp_mse": p2,
+                    "penrose/gy_mse": p3,
+                    "epoch": epoch,
+                })
+            spnn_model.train()
 
         # wandb val logging
         if args.wandb and args.is_main:
@@ -382,7 +460,7 @@ def main_worker(gpu, ngpus_per_node, args):
             }, is_best, checkpoint_dir=args.checkpoint_dir)
 
 
-def train(train_loader, model, criterion, optimizer, epoch, device, args):
+def train(train_loader, model, criterion, optimizer, epoch, device, args, scheduler=None):
     
     use_accel = not args.no_accel and torch.accelerator.is_available()
 
@@ -438,6 +516,8 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args):
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         # wandb logging
         if args.wandb and i % args.print_freq == 0 and args.is_main:

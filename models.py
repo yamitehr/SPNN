@@ -52,8 +52,10 @@ class Cayley1x1Conv(BaseOrthogonal1x1Conv):
         C = self.channels
         B = self.A_unconstrained.to(device=device, dtype=torch.float32)
         A = B - B.t()
-        I = torch.eye(C, device=device, dtype=torch.float32)
-        W = torch.linalg.solve((1 + self.eps) * I + A, I - A)
+        # Matrix exponential of skew-symmetric A is always orthogonal.
+        # Unlike Cayley transform, exp(A) covers all of SO(n) without
+        # singularities — no matrix inversion needed, cannot fail.
+        W = torch.matrix_exp(A)
         return W.to(dtype=dtype)  # [C, C]
 
 class Householder1x1Conv(BaseOrthogonal1x1Conv):
@@ -173,8 +175,7 @@ class PatchCayleyMix(BasePatchOrthogonalMix):
         D = self.D
         B = self.B.to(device=device, dtype=torch.float32)
         A = B - B.t()
-        I = torch.eye(D, device=device, dtype=torch.float32)
-        W = torch.linalg.solve((1 + self.eps) * I + A, I - A)
+        W = torch.matrix_exp(A)
         return W.to(dtype=dtype)  # [D, D]
 
 

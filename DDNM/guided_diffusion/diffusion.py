@@ -2,7 +2,7 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
-from models import SPNN
+from models import SPNN, ConvPINNBlock, PixelUnshuffleBlock
 from huggingface_hub import hf_hub_download
 
 import numpy as np
@@ -16,6 +16,7 @@ from functions.ckpt_util import download
 import torchvision.utils as tvu
 
 from guided_diffusion.models import Model
+from guided_diffusion.script_util import create_model, create_classifier, classifier_defaults, args_to_dict
 import random
 
 
@@ -40,7 +41,7 @@ def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_time
         )
     elif beta_schedule == "const":
         betas = beta_end * np.ones(num_diffusion_timesteps, dtype=np.float64)
-    elif beta_schedule == "jsd":  
+    elif beta_schedule == "jsd":
         betas = 1.0 / np.linspace(
             num_diffusion_timesteps, 1, num_diffusion_timesteps, dtype=np.float64
         )
@@ -91,13 +92,47 @@ class Diffusion(object):
             self.logvar = posterior_variance.clamp(min=1e-20).log()
 
     def sample(self):
-        model = Model(self.config)
-        ckpt = os.path.join(self.args.exp, "logs/celeba/celeba_hq.ckpt")
-        if not os.path.exists(ckpt):
-            download('https://image-editing-test-12345.s3-us-west-2.amazonaws.com/checkpoints/celeba_hq.ckpt', ckpt)
-        model.load_state_dict(torch.load(ckpt, map_location=self.device, weights_only=False))
-        model.to(self.device)
-        model = torch.nn.DataParallel(model)
+        cls_fn = None
+
+        if self.config.model.type == 'simple':
+            model = Model(self.config)
+            if self.config.data.dataset == 'CelebA_HQ':
+                ckpt = os.path.join(self.args.exp, "logs/celeba/celeba_hq.ckpt")
+                if not os.path.exists(ckpt):
+                    download('https://image-editing-test-12345.s3-us-west-2.amazonaws.com/checkpoints/celeba_hq.ckpt', ckpt)
+            else:
+                raise ValueError(f"Unsupported dataset for 'simple' model type: {self.config.data.dataset}")
+            model.load_state_dict(torch.load(ckpt, map_location=self.device, weights_only=False))
+            model.to(self.device)
+            model = torch.nn.DataParallel(model)
+
+        elif self.config.model.type == 'openai':
+            config_dict = vars(self.config.model)
+            model = create_model(**config_dict)
+            if self.config.model.use_fp16:
+                model.convert_to_fp16()
+            if getattr(self.config.model, 'class_cond', False):
+                ckpt = os.path.join(self.args.exp, 'logs/imagenet/%dx%d_diffusion.pt' % (
+                    self.config.data.image_size, self.config.data.image_size))
+                if not os.path.exists(ckpt):
+                    download(
+                        'https://openaipublic.blob.core.windows.net/diffusion/jul-2021/%dx%d_diffusion_uncond.pt' % (
+                            self.config.data.image_size, self.config.data.image_size), ckpt)
+            else:
+                ckpt = os.path.join(self.args.exp, "logs/imagenet/256x256_diffusion_uncond.pt")
+                if not os.path.exists(ckpt):
+                    download(
+                        'https://openaipublic.blob.core.windows.net/diffusion/jul-2021/256x256_diffusion_uncond.pt',
+                        ckpt)
+
+            model.load_state_dict(torch.load(ckpt, map_location=self.device, weights_only=False))
+            model.to(self.device)
+            model.eval()
+            model = torch.nn.DataParallel(model)
+
+        else:
+            raise ValueError(f"Unknown model type: {self.config.model.type}")
+
         print('Run Simplified DDNM.',
               f'{self.config.time_travel.T_sampling} sampling steps.',
               f'travel_length = {self.config.time_travel.travel_length},',
@@ -135,17 +170,73 @@ class Diffusion(object):
             generator=g,
         )
 
-        classifier = SPNN(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=256).to(
-            self.device)
+        # Load SPNN classifier
+        if config.data.dataset == 'ImageNet':
+            spnn_ckpt = getattr(args, 'spnn_ckpt', None)
+            num_classes = getattr(args, 'spnn_num_classes', 10)
+            mix_type = getattr(args, 'spnn_mix_type', 'householder')
+            scale_bound = getattr(args, 'spnn_scale_bound', 1.0)
+            hidden = 256
 
-        ckpt_path = hf_hub_download(repo_id="yamitehr/SPNN", filename="spnn_celebahq_256.pth")
+            layer_channels = [
+                (PixelUnshuffleBlock, {"r": 4}),
+                (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
+                                 "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+                (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
+                                 "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+                (PixelUnshuffleBlock, {"r": 4}),
+                (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
+                                 "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+                (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
+                                 "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+                (PixelUnshuffleBlock, {"r": 4}),
+                (ConvPINNBlock, {"in_ch": 768, "out_ch": 192, "hidden": hidden,
+                                 "scale_bound": scale_bound, "feat_size": 4, "mix_type": mix_type}),
+                (PixelUnshuffleBlock, {"r": 4}),
+                (ConvPINNBlock, {"in_ch": 3072, "out_ch": 1024, "hidden": hidden,
+                                 "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
+                (ConvPINNBlock, {"in_ch": 1024, "out_ch": num_classes, "hidden": hidden,
+                                 "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
+            ]
+            classifier = SPNN(img_ch=3, num_classes=num_classes, img_size=256,
+                              layer_channels=layer_channels).to(self.device)
 
-        print(f"Loading classifier from {ckpt_path}")
-        classifier.load_state_dict(torch.load(ckpt_path, map_location=self.device, weights_only=False))
+            assert spnn_ckpt is not None, "Must provide --spnn_ckpt for ImageNet DDNM"
+            raw = torch.load(spnn_ckpt, map_location=self.device, weights_only=False)
+            state_dict = raw.get("state_dict", raw) if isinstance(raw, dict) and "state_dict" in raw else raw
+            classifier.load_state_dict(state_dict)
+            print(f"Loaded SPNN classifier ({num_classes} classes, {mix_type}) from {spnn_ckpt}")
+        else:
+            # CelebA
+            classifier = SPNN(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=256).to(
+                self.device)
+            ckpt_path = hf_hub_download(repo_id="yamitehr/SPNN", filename="spnn_celebahq_256.pth")
+            print(f"Loading classifier from {ckpt_path}")
+            classifier.load_state_dict(torch.load(ckpt_path, map_location=self.device, weights_only=False))
+
         classifier.eval()
 
-        A = lambda z, **kwargs: classifier(z, **kwargs)
-        Ap = lambda logits, **kwargs: (classifier.pinv(logits, **kwargs))
+        # Domain conversion: diffusion operates in [-1, 1], SPNN trained with ImageNet normalization
+        if config.data.dataset == 'ImageNet':
+            img_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+            img_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+
+            def diffusion_to_spnn(x):
+                """Convert [-1,1] diffusion domain to ImageNet-normalized domain."""
+                x01 = (x + 1.0) / 2.0  # [-1,1] -> [0,1]
+                return (x01 - img_mean) / img_std
+
+            def spnn_to_diffusion(x):
+                """Convert ImageNet-normalized domain back to [-1,1] diffusion domain."""
+                x01 = x * img_std + img_mean  # denormalize to [0,1]
+                return x01 * 2.0 - 1.0  # [0,1] -> [-1,1]
+
+            A = lambda z, **kwargs: classifier(diffusion_to_spnn(z), **kwargs)
+            Ap = lambda logits, **kwargs: spnn_to_diffusion(classifier.pinv(logits, **kwargs))
+        else:
+            # CelebA: both diffusion and SPNN use [-1,1] (rescaled)
+            A = lambda z, **kwargs: classifier(z, **kwargs)
+            Ap = lambda logits, **kwargs: (classifier.pinv(logits, **kwargs))
 
         print(f'Start from {args.subset_start}')
         idx_init = args.subset_start
@@ -160,7 +251,7 @@ class Diffusion(object):
 
             if config.sampling.batch_size != 1:
                 raise ValueError("please change the config file to set batch size as 1")
-                
+
             # init x_T
             torch.manual_seed(args.seed)
             x = torch.randn(
@@ -182,7 +273,7 @@ class Diffusion(object):
                                           config.time_travel.travel_repeat,
                                           )
                 time_pairs = list(zip(times[:-1], times[1:]))
-                
+
                 for step_idx, (i, j) in enumerate(tqdm.tqdm(time_pairs)):
                     i, j = i * skip, j * skip
                     if j < 0: j = -1
@@ -216,7 +307,15 @@ class Diffusion(object):
                         # None-Linear Back Projection
                         y_cur, z_cur = A(x0_t_hat, return_latents=True)
 
-                        if (y_cur.sigmoid() - y.sigmoid()).abs().mean() > args.nlbp_stop_cond:
+                        # Stopping condition: task-dependent error metric
+                        if y_cur.dim() == 2:
+                            # Classification: sigmoid-based attribute error
+                            nlbp_error = (y_cur.sigmoid() - y.sigmoid()).abs().mean()
+                        else:
+                            # Detection / spatial output: raw tensor distance
+                            nlbp_error = (y_cur - y).abs().mean()
+
+                        if nlbp_error > args.nlbp_stop_cond:
 
                             y_tar, z_tar = A(Ap(y), return_latents=True)
                             y_proj, z_proj = A(Ap(A(x0_t_hat)), return_latents=True)
@@ -230,6 +329,11 @@ class Diffusion(object):
                             y_final = y_cur + lambda_t * (y_tar - y_proj)
 
                             x0_t_hat = Ap(y_final, latents=z_final)
+
+                        if step_idx % 10 == 0 or step_idx < 5:
+                            print(f"  step {step_idx}: t={i} | x0_t range=[{x0_t.min():.3f}, {x0_t.max():.3f}] mean={x0_t.mean():.3f} | "
+                                  f"x0_t_hat range=[{x0_t_hat.min():.3f}, {x0_t_hat.max():.3f}] mean={x0_t_hat.mean():.3f} | "
+                                  f"nlbp_error={nlbp_error:.4f} lambda_t={lambda_t:.2f}")
 
                         c2 = (1 - at_next - sigma_t ** 2).clamp(min=0).sqrt()
                         xt_next = at_next.sqrt() * x0_t_hat + c2 * et + sigma_t * torch.randn_like(x0_t)
@@ -258,6 +362,15 @@ class Diffusion(object):
             grid_path = os.path.join(results_dir, f"grid_{idx_so_far}.png")
             tvu.save_image(res_grid, grid_path)
 
+            # Print classification: true class vs SPNN predictions on original and generated
+            with torch.no_grad():
+                y_orig = A(x_orig)  # SPNN on original
+                y_gen = A(data_transform(config, final_x0.to(self.device)))  # SPNN on generated
+                pred_orig = y_orig.argmax(dim=1).item()
+                pred_gen = y_gen.argmax(dim=1).item()
+                true_cls = classes[0].item() if classes.dim() > 0 else classes.item()
+                print(f"  [img {idx_so_far}] true_class={true_cls} | spnn_on_orig={pred_orig} | spnn_on_generated={pred_gen}")
+
             mse = torch.mean((final_x0[0].to(self.device) - orig) ** 2)
             psnr = 10 * torch.log10(1 / mse)
             avg_psnr += psnr
@@ -270,10 +383,10 @@ class Diffusion(object):
         print("Total Average PSNR: %.2f" % avg_psnr)
         print("Number of samples: %d" % (idx_so_far - idx_init))
         print(f"Results saved to: {os.path.abspath(self.args.image_folder)}")
-        
-        
 
-# Code form RePaint   
+
+
+# Code form RePaint
 def get_schedule_jump(T_sampling, travel_length, travel_repeat):
     jumps = {}
     for j in range(0, T_sampling - travel_length, travel_length):
@@ -312,7 +425,7 @@ def _check_times(times, t_0, T_sampling):
     for t in times:
         assert t >= t_0, (t, t_0)
         assert t <= T_sampling, (t, T_sampling)
-        
+
 def compute_alpha(beta, t):
     beta = torch.cat([torch.zeros(1).to(beta.device), beta], dim=0)
     a = (1 - beta).cumprod(dim=0).index_select(0, t + 1).view(-1, 1, 1, 1)

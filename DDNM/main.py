@@ -58,7 +58,7 @@ def parse_args_and_config():
         "--min_bp_step", type=int, default=600, help="Minimum step to start back-projection"
     )
     parser.add_argument(
-        "--lambda1", type=float, default=1.0, help="Lambda for BP when step < min_bp_step"
+        "--lambda1", type=float, default=0.5, help="Lambda for BP when step < min_bp_step"
     )
     parser.add_argument(
         "--lambda2", type=float, default=0.5, help="Lambda for BP when step >= min_bp_step"
@@ -66,6 +66,11 @@ def parse_args_and_config():
     parser.add_argument(
         "--nlbp_stop_cond", type=float, default=0.11, help="Skip back-projection when attribute error is below this threshold"
     )
+    # SPNN args for ImageNet/ImageNette
+    parser.add_argument("--spnn_ckpt", type=str, default=None, help="Path to SPNN classifier checkpoint")
+    parser.add_argument("--spnn_num_classes", type=int, default=10, help="Number of SPNN classes (10 for ImageNette, 1000 for ImageNet)")
+    parser.add_argument("--spnn_mix_type", type=str, default="householder", choices=["cayley", "householder"])
+    parser.add_argument("--spnn_scale_bound", type=float, default=1.0)
 
     args = parser.parse_args()
 

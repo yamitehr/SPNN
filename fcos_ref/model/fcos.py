@@ -2,7 +2,7 @@ from .head import ClsCntRegHead
 from .fpn_neck import FPN
 from .fpn_neck_spnn import FPN_SPNN
 from .backbone.resnet import resnet50
-from .backbone.spnn_backbone import SPNNBackbone
+from .backbone.spnn_backbone import SPNNBackbone, build_spnn_e2e, transfer_backbone_from_classifier
 import torch.nn as nn
 from .loss import GenTargets,LOSS,coords_fmap2orig
 import torch
@@ -66,6 +66,7 @@ class FCOS_SPNN(nn.Module):
         self.backbone = SPNNBackbone(
             hidden=getattr(config, 'spnn_hidden', 256),
             mix_type=getattr(config, 'spnn_mix_type', 'cayley'),
+            scale_bound=getattr(config, 'spnn_scale_bound', 2.0),
             pretrained_path=getattr(config, 'spnn_pretrained', None),
         )
         self.fpn = FPN_SPNN(
@@ -271,11 +272,11 @@ class FCOSDetector(nn.Module):
             self.detection_head=DetectHead(config.score_threshold,config.nms_iou_threshold,
                                             config.max_detection_boxes_num,config.strides,config)
             self.clip_boxes=ClipBoxes()
-        
-    
+
+
     def forward(self,inputs):
         '''
-        inputs 
+        inputs
         [training] list  batch_imgs,batch_boxes,batch_classes
         [inference] img
         '''
@@ -289,13 +290,74 @@ class FCOSDetector(nn.Module):
         elif self.mode=="inference":
             # raise NotImplementedError("no implement inference model")
             '''
-            for inference mode, img should preprocessed before feeding in net 
+            for inference mode, img should preprocessed before feeding in net
             '''
             batch_imgs=inputs
             out=self.fcos_body(batch_imgs)
             scores,classes,boxes=self.detection_head(out)
             boxes=self.clip_boxes(batch_imgs,boxes)
             return scores,classes,boxes
+
+
+class FCOSDetectorE2E(nn.Module):
+    """End-to-end invertible SPNN detector using FCOS losses at single scale.
+
+    The full SPNN maps [3,256,256] -> [25,16,16] (all invertible, has pinv).
+    Output is split into cls/cnt/reg and fed to the same FCOS loss functions.
+    """
+
+    def __init__(self, mode="training", config=None):
+        super().__init__()
+        if config is None:
+            config = DefaultConfig
+        self.mode = mode
+        self.config = config
+
+        self.spnn = build_spnn_e2e(
+            hidden=getattr(config, 'spnn_hidden', 256),
+            mix_type=getattr(config, 'spnn_mix_type', 'cayley'),
+            scale_bound=getattr(config, 'spnn_scale_bound', 2.0),
+        )
+
+        # Load pretrained backbone if provided
+        pretrained = getattr(config, 'spnn_pretrained', None)
+        if pretrained is not None:
+            transfer_backbone_from_classifier(pretrained, self.spnn)
+
+        if mode == "training":
+            self.target_layer = GenTargets(strides=config.strides, limit_range=config.limit_range)
+            self.loss_layer = LOSS(config=config)
+        elif mode == "inference":
+            self.detection_head = DetectHead(
+                config.score_threshold, config.nms_iou_threshold,
+                config.max_detection_boxes_num, config.strides, config,
+            )
+            self.clip_boxes = ClipBoxes()
+
+    def _split_output(self, x):
+        """Split SPNN output [B,25,16,16] into FCOS format (single-element lists)."""
+        reg = torch.nn.functional.softplus(x[:, 0:4, :, :])  # ltrb distances, must be positive
+        cnt = x[:, 4:5, :, :]               # centerness logit
+        cls = x[:, 5:25, :, :]              # class logits
+        return [cls], [cnt], [reg]
+
+    def forward(self, inputs):
+        if self.mode == "training":
+            batch_imgs, batch_boxes, batch_classes = inputs
+            raw = self.spnn(batch_imgs)  # [B, 25, 16, 16]
+            cls_logits, cnt_logits, reg_preds = self._split_output(raw)
+            out = [cls_logits, cnt_logits, reg_preds]
+            targets = self.target_layer([out, batch_boxes, batch_classes])
+            losses = self.loss_layer([out, targets])
+            return losses
+        elif self.mode == "inference":
+            batch_imgs = inputs
+            raw = self.spnn(batch_imgs)
+            cls_logits, cnt_logits, reg_preds = self._split_output(raw)
+            out = [cls_logits, cnt_logits, reg_preds]
+            scores, classes, boxes = self.detection_head(out)
+            boxes = self.clip_boxes(batch_imgs, boxes)
+            return scores, classes, boxes
 
 
 

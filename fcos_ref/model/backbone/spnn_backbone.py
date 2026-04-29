@@ -26,7 +26,7 @@ if _project_root not in sys.path:
 from models import SPNN, ConvPINNBlock, PixelUnshuffleBlock
 
 
-def build_spnn_backbone(hidden=256, mix_type="cayley"):
+def build_spnn_backbone(hidden=256, mix_type="cayley", scale_bound=2.0):
     """Build the SPNN backbone (blocks 0-5) that outputs [B, 48, 16, 16].
 
     This is the same architecture as the ImageNet classifier backbone,
@@ -35,14 +35,14 @@ def build_spnn_backbone(hidden=256, mix_type="cayley"):
     layer_channels = [
         (PixelUnshuffleBlock, {"r": 4}),
         (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 64, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
         (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 64, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
         (PixelUnshuffleBlock, {"r": 4}),
         (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 16, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
         (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 16, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
     ]
 
     model = SPNN(
@@ -70,7 +70,16 @@ def transfer_backbone_from_classifier(cls_checkpoint_path, spnn_backbone):
     backbone_state = spnn_backbone.state_dict()
     transferred = 0
 
+    # Normalize keys: strip common prefixes from FCOS/DataParallel checkpoints
+    normalized = {}
     for key, val in cls_state.items():
+        k = key
+        for prefix in ["module.", "fcos_body.backbone.spnn.", "fcos_body.backbone."]:
+            if k.startswith(prefix):
+                k = k[len(prefix):]
+        normalized[k] = val
+
+    for key, val in normalized.items():
         # Blocks 0-5 are the backbone in both classifier and detector
         if any(key.startswith(f"pinn.blocks.{i}.") for i in range(6)):
             if key in backbone_state and backbone_state[key].shape == val.shape:
@@ -80,6 +89,39 @@ def transfer_backbone_from_classifier(cls_checkpoint_path, spnn_backbone):
     spnn_backbone.load_state_dict(backbone_state)
     print(f"[transfer] Copied {transferred} backbone parameter tensors from classification checkpoint")
     return transferred
+
+
+def build_spnn_e2e(hidden=256, mix_type="cayley", scale_bound=2.0):
+    """Build end-to-end invertible SPNN: image [3,256,256] -> detection grid [25,16,16].
+
+    Backbone (blocks 0-5) + single detection block (block 6), all invertible.
+    Output: 25 channels = 4 (ltrb) + 1 (objectness) + 20 (classes)
+    Single detection block has x1=23 channels — rich conditioning signal.
+    """
+    layer_channels = [
+        # Backbone (shared with classifier, blocks 0-5)
+        (PixelUnshuffleBlock, {"r": 4}),
+        (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+        (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+        (PixelUnshuffleBlock, {"r": 4}),
+        (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+        (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+        # Detection head (block 6, invertible) — x1=23ch, x0=25ch
+        (ConvPINNBlock, {"in_ch": 48, "out_ch": 25, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+    ]
+
+    return SPNN(
+        img_ch=3,
+        num_classes=25,
+        img_size=256,
+        layer_channels=layer_channels,
+        output_spatial_size=(16, 16),
+    )
 
 
 class SPNNBackbone(nn.Module):
@@ -92,9 +134,9 @@ class SPNNBackbone(nn.Module):
     The FPN neck handles creating multi-scale features.
     """
 
-    def __init__(self, hidden=256, mix_type="cayley", pretrained_path=None):
+    def __init__(self, hidden=256, mix_type="cayley", scale_bound=2.0, pretrained_path=None):
         super().__init__()
-        self.spnn = build_spnn_backbone(hidden=hidden, mix_type=mix_type)
+        self.spnn = build_spnn_backbone(hidden=hidden, mix_type=mix_type, scale_bound=scale_bound)
         self.out_channels = 48
 
         if pretrained_path is not None:

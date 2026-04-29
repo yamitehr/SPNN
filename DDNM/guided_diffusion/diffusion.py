@@ -329,6 +329,7 @@ class Diffusion(object):
                             y_final = y_cur + lambda_t * (y_tar - y_proj)
 
                             x0_t_hat = Ap(y_final, latents=z_final)
+                            x0_t_hat = x0_t_hat.clamp(-1, 1)
 
                         if step_idx % 10 == 0 or step_idx < 5:
                             print(f"  step {step_idx}: t={i} | x0_t range=[{x0_t.min():.3f}, {x0_t.max():.3f}] mean={x0_t.mean():.3f} | "

@@ -41,6 +41,8 @@ parser.add_argument('--dataset', type=str, default='coco', choices=['coco', 'pas
 parser.add_argument('--arch', type=str, default='large_hourglass')
 parser.add_argument('--spnn_backbone', type=str, default=None,
                     help='Path to pretrained SPNN classifier checkpoint for backbone transfer')
+parser.add_argument('--hmap_init_scale', type=float, default=0.01,
+                    help='Initial scale for heatmap affine adapter (default: 0.01)')
 
 parser.add_argument('--img_size', type=int, default=512)
 parser.add_argument('--split_ratio', type=float, default=1.0)
@@ -120,7 +122,8 @@ def main():
                          head_conv=64, num_classes=train_dataset.num_classes)
   elif cfg.arch == 'spnn':
     model = get_spnn_centernet(num_classes=train_dataset.num_classes,
-                               pretrained_backbone=cfg.spnn_backbone)
+                               pretrained_backbone=cfg.spnn_backbone,
+                               hmap_init_scale=cfg.hmap_init_scale)
   else:
     raise NotImplementedError
 

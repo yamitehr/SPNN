@@ -69,16 +69,15 @@ class SPNNCenterNet(nn.Module):
     Access the raw SPNN via model.spnn for pinv() / DDNM.
     """
 
-    def __init__(self, spnn, num_classes=20):
+    def __init__(self, spnn, num_classes=20, hmap_init_scale=0.01):
         super().__init__()
         self.spnn = spnn
         self.num_classes = num_classes
-        # Scale + bias for heatmap channels.
-        # SPNN output is in [-4, 4] range. Without scaling, sigmoid ≈ 0.5 everywhere,
-        # which causes focal loss to explode. We start with small scale (0.01) so
-        # initial output is dominated by bias (-2.19), giving sigmoid ≈ 0.1.
-        # The scale grows during training as the SPNN learns meaningful heatmaps.
-        self.hmap_scale = nn.Parameter(torch.ones(1, num_classes, 1, 1) * 0.01)
+        # Affine adapter for heatmap: y = scale * raw + bias.
+        # Bijective (fully invertible): raw = (y - bias) / scale.
+        # Composition: affine ∘ SPNN is still surjective.
+        # For pinv: undo affine first, then SPNN.pinv.
+        self.hmap_scale = nn.Parameter(torch.ones(1, num_classes, 1, 1) * hmap_init_scale)
         self.hmap_bias = nn.Parameter(torch.full((1, num_classes, 1, 1), -2.19))
 
     def forward(self, x):
@@ -88,14 +87,22 @@ class SPNNCenterNet(nn.Module):
         w_h_ = raw[:, self.num_classes + 2:]  # [B, 2, H/4, W/4]
         return [[hmap, regs, w_h_]]
 
+    def hmap_to_raw(self, hmap):
+        """Undo affine: raw = (hmap - bias) / scale. For pinv chain."""
+        return (hmap - self.hmap_bias.to(hmap.device)) / self.hmap_scale.to(hmap.device)
+
 
 def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
-                         scale_bound=1.0, pretrained_backbone=None):
+                         scale_bound=1.0, pretrained_backbone=None,
+                         hmap_init_scale=0.01):
     """Build end-to-end invertible SPNN for CenterNet detection.
 
-    Architecture:
-      [3, 256, 256] -> PixelUnshuffle(4) -> [48, 64, 64]
-                    -> ConvPINNBlock(48 -> num_classes+4) -> [24, 64, 64]
+    Architecture (Option C: multi-scale 128+64 with 3 backbone blocks):
+      [3, 256, 256] -> PixelUnshuffle(2) -> [12, 128, 128]
+                    -> ConvPINNBlock(12 -> 8)  -> [8, 128, 128]    x1=4
+                    -> PixelUnshuffle(2) -> [32, 64, 64]
+                    -> ConvPINNBlock(32 -> 28) -> [28, 64, 64]     x1=4
+                    -> ConvPINNBlock(28 -> 24) -> [24, 64, 64]     x1=4
 
     Output: [num_classes+4, 64, 64] at stride 4
       channels 0:num_classes  = class heatmaps
@@ -105,11 +112,28 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
     out_ch = num_classes + 4  # 20 + 4 = 24 for VOC
 
     layer_channels = [
-        (PixelUnshuffleBlock, {"r": 4}),
-        (ConvPINNBlock, {"in_ch": 48, "out_ch": out_ch, "hidden": hidden,
+        # 128x128 processing (fine spatial detail)
+        (PixelUnshuffleBlock, {"r": 2}),
+        (ConvPINNBlock, {"in_ch": 12, "out_ch": 8, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 128,
+                         "mix_type": mix_type}),
+        # 64x64 processing
+        (PixelUnshuffleBlock, {"r": 2}),
+        (ConvPINNBlock, {"in_ch": 32, "out_ch": 28, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 64,
+                         "mix_type": mix_type}),
+        (ConvPINNBlock, {"in_ch": 28, "out_ch": out_ch, "hidden": hidden,
                          "scale_bound": scale_bound, "feat_size": 64,
                          "mix_type": mix_type}),
     ]
+
+    # # Previous architecture (single block):
+    # layer_channels = [
+    #     (PixelUnshuffleBlock, {"r": 4}),
+    #     (ConvPINNBlock, {"in_ch": 48, "out_ch": out_ch, "hidden": hidden,
+    #                      "scale_bound": scale_bound, "feat_size": 64,
+    #                      "mix_type": mix_type}),
+    # ]
 
     spnn = SPNN(
         img_ch=3,
@@ -122,10 +146,11 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
     if pretrained_backbone is not None:
         transfer_backbone_from_classifier(pretrained_backbone, spnn)
 
-    return SPNNCenterNet(spnn, num_classes=num_classes)
+    return SPNNCenterNet(spnn, num_classes=num_classes, hmap_init_scale=hmap_init_scale)
 
 
-def get_spnn_centernet(num_classes=20, pretrained_backbone=None):
+def get_spnn_centernet(num_classes=20, pretrained_backbone=None, hmap_init_scale=0.01):
     """Entry point matching CenterNet's model creation pattern."""
     return build_spnn_centernet(num_classes=num_classes,
-                                pretrained_backbone=pretrained_backbone)
+                                pretrained_backbone=pretrained_backbone,
+                                hmap_init_scale=hmap_init_scale)

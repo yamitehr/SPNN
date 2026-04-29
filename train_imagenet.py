@@ -45,29 +45,29 @@ from torch.utils.data import Subset
 from models import SPNN, ConvPINNBlock, PixelUnshuffleBlock
 
 
-def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley"):
+def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley", scale_bound=2.0):
     """Build SPNN for classification with the shared backbone architecture."""
     layer_channels = [
         # Backbone (shared with detection)
         (PixelUnshuffleBlock, {"r": 4}),
         (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 64, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
         (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 64, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
         (PixelUnshuffleBlock, {"r": 4}),
         (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 16, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
         (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 16, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
         # Classification head
         (PixelUnshuffleBlock, {"r": 4}),
         (ConvPINNBlock, {"in_ch": 768, "out_ch": 192, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 4, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 4, "mix_type": mix_type}),
         (PixelUnshuffleBlock, {"r": 4}),
         (ConvPINNBlock, {"in_ch": 3072, "out_ch": 1024, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 1, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
         (ConvPINNBlock, {"in_ch": 1024, "out_ch": num_classes, "hidden": hidden,
-                         "scale_bound": 2.0, "feat_size": 1, "mix_type": mix_type}),
+                         "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
     ]
     return SPNN(
         img_ch=3, num_classes=num_classes, img_size=256,
@@ -153,6 +153,11 @@ parser.add_argument('--wandb-project', default='spnn-imagenet', type=str)
 parser.add_argument('--wandb-run-name', default=None, type=str)
 parser.add_argument('--checkpoint-dir', default='check_points_cls', type=str,
                     help='directory to save checkpoints')
+parser.add_argument('--mix-type', default='householder', type=str,
+                    choices=['cayley', 'householder'],
+                    help='orthogonal mixing layer type (default: householder)')
+parser.add_argument('--scale-bound', default=2.0, type=float,
+                    help='scale bound for s-network: s in [exp(-b), exp(b)] (default: 2.0)')
 
 best_acc1 = 0
 
@@ -232,7 +237,7 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create SPNN classification model
     print(f"=> creating SPNN classification model (num_classes={args.num_classes})")
-    model = build_classification_spnn(num_classes=args.num_classes)
+    model = build_classification_spnn(num_classes=args.num_classes, mix_type=args.mix_type, scale_bound=args.scale_bound)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   Total params: {total_params:,}")
 
@@ -408,17 +413,18 @@ def main_worker(gpu, ngpus_per_node, args):
                     y_g = spnn_model(val_imgs)
 
                     # 1. g(g'(g(x))) == g(x)
-                    y_ggg = spnn_model(spnn_model.pinv(y_g))
+                    x_inv = spnn_model.pinv(y_g)
+                    y_ggg = spnn_model(x_inv)
                     p1_sum += (y_ggg - y_g).pow(2).mean().item()
 
                     # 2. g'(g(g'(y))) == g'(y)  [using y = g(x)]
-                    x_gp = spnn_model.pinv(y_g)
-                    x_gpgp = spnn_model.pinv(spnn_model(x_gp))
-                    p2_sum += (x_gpgp - x_gp).pow(2).mean().item()
+                    x_gpgp = spnn_model.pinv(y_ggg)
+                    p2_sum += (x_gpgp - x_inv).pow(2).mean().item()
 
-                    # 3. g(g'(y)) == y  [using y = g(x)]
-                    y_cycle = spnn_model(spnn_model.pinv(y_g))
-                    p3_sum += (y_cycle - y_g).pow(2).mean().item()
+                    # 3. g(g'(y)) == y  [random y, not from g(x)]
+                    y_rand = torch.randn_like(y_g)
+                    y_rt = spnn_model(spnn_model.pinv(y_rand))
+                    p3_sum += (y_rt - y_rand).pow(2).mean().item()
 
                     n_batches += 1
 

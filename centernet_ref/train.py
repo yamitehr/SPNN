@@ -3,7 +3,8 @@ import sys
 import time
 import argparse
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib'))
 
 # os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"  # see issue #152
 # os.environ["CUDA_VISIBLE_DEVICES"] = '0'
@@ -14,11 +15,10 @@ import torch.nn as nn
 import torch.utils.data
 import torch.distributed as dist
 
-from datasets.coco import COCO, COCO_eval
-from datasets.pascal import PascalVOC, PascalVOC_eval
+from centernet_datasets.coco import COCO, COCO_eval
+from centernet_datasets.pascal import PascalVOC, PascalVOC_eval
 
-from nets.hourglass import get_hourglass
-from nets.resdcn import get_pose_net
+from nets.spnn_centernet import get_spnn_centernet
 
 from utils.utils import _tranpose_and_gather_feature, load_model
 from utils.image import transform_preds
@@ -39,6 +39,8 @@ parser.add_argument('--pretrain_name', type=str, default='pretrain')
 
 parser.add_argument('--dataset', type=str, default='coco', choices=['coco', 'pascal'])
 parser.add_argument('--arch', type=str, default='large_hourglass')
+parser.add_argument('--spnn_backbone', type=str, default=None,
+                    help='Path to pretrained SPNN classifier checkpoint for backbone transfer')
 
 parser.add_argument('--img_size', type=int, default=512)
 parser.add_argument('--split_ratio', type=float, default=1.0)
@@ -110,9 +112,15 @@ def main():
 
   print('Creating model...')
   if 'hourglass' in cfg.arch:
+    from nets.hourglass import get_hourglass
     model = get_hourglass[cfg.arch]
   elif 'resdcn' in cfg.arch:
-    model = get_pose_net(num_layers=int(cfg.arch.split('_')[-1]), num_classes=train_dataset.num_classes)
+    from nets.resdcn import get_pose_net
+    model = get_pose_net(num_layers=int(cfg.arch.split('_')[-1]),
+                         head_conv=64, num_classes=train_dataset.num_classes)
+  elif cfg.arch == 'spnn':
+    model = get_spnn_centernet(num_classes=train_dataset.num_classes,
+                               pretrained_backbone=cfg.spnn_backbone)
   else:
     raise NotImplementedError
 

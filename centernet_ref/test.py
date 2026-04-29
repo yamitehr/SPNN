@@ -12,8 +12,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 import torch
 import torch.utils.data
 
-from datasets.coco import COCO_eval
-from datasets.pascal import PascalVOC_eval
+from centernet_datasets.coco import COCO_eval
+from centernet_datasets.pascal import PascalVOC_eval
 
 from nets.hourglass import get_hourglass
 from nets.resdcn import get_pose_net

@@ -16,8 +16,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'lib'))
 import torch
 import torch.utils.data
 
-from datasets.coco import COCO_MEAN, COCO_STD, COCO_NAMES
-from datasets.pascal import VOC_MEAN, VOC_STD, VOC_NAMES
+from centernet_datasets.coco import COCO_MEAN, COCO_STD, COCO_NAMES
+from centernet_datasets.pascal import VOC_MEAN, VOC_STD, VOC_NAMES
 
 from nets.hourglass import get_hourglass
 from nets.resdcn import get_pose_net

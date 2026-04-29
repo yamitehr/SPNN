@@ -25,8 +25,8 @@ _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 if _project_root not in sys.path:
     sys.path.insert(0, _project_root)
 
-from model.fcos import FCOSDetector
-from model.config import SPNNConfig
+from model.fcos import FCOSDetector, FCOSDetectorE2E
+from model.config import SPNNConfig, SPNNE2EConfig
 from dataset.VOC_dataset import VOCDataset
 from dataset.augment import Transforms
 from eval_voc import eval_ap_2d, sort_by_score
@@ -53,12 +53,24 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
 
     # SPNN-specific
-    parser.add_argument("--mix_type", type=str, default="cayley",
+    parser.add_argument("--mix_type", type=str, default="householder",
                         choices=["cayley", "householder"])
+    parser.add_argument("--scale_bound", type=float, default=2.0,
+                        help="Scale bound for s-network: s in [exp(-b), exp(b)]")
     parser.add_argument("--pretrained_backbone", type=str, default=None,
                         help="Path to ImageNet classification checkpoint for backbone transfer")
     parser.add_argument("--freeze_backbone_epochs", type=int, default=0,
                         help="Freeze SPNN backbone for first N epochs")
+
+    parser.add_argument("--end_to_end", action="store_true",
+                        help="Use end-to-end invertible SPNN (for DDNM). "
+                             "Single scale, no FPN/head, full pinv() support.")
+
+    # SPNN cycle/reconstruction losses
+    parser.add_argument("--lambda_cycle", type=float, default=0.0,
+                        help="Weight for right-inverse cycle loss || f(f'(y)) - y ||^2")
+    parser.add_argument("--lambda_rec", type=float, default=0.0,
+                        help="Weight for image reconstruction loss || f'(f(x)) - x ||^2")
 
     # Wandb
     parser.add_argument("--wandb", action="store_true")
@@ -157,8 +169,12 @@ def main():
         wandb.init(project=opt.wandb_project, name=opt.wandb_run_name, config=vars(opt))
 
     # Config
-    config = SPNNConfig()
+    if opt.end_to_end:
+        config = SPNNE2EConfig()
+    else:
+        config = SPNNConfig()
     config.spnn_mix_type = opt.mix_type
+    config.spnn_scale_bound = opt.scale_bound
     config.spnn_pretrained = opt.pretrained_backbone
 
     # Dataset
@@ -187,7 +203,10 @@ def main():
     print(f"Train: {len(train_dataset)} images, Eval: {len(eval_dataset)} images")
 
     # Model — training mode
-    model_train = FCOSDetector(mode="training", config=config).cuda()
+    if opt.end_to_end:
+        model_train = FCOSDetectorE2E(mode="training", config=config).cuda()
+    else:
+        model_train = FCOSDetector(mode="training", config=config).cuda()
     model_train = torch.nn.DataParallel(model_train)
 
     total_params = sum(p.numel() for p in model_train.parameters())
@@ -250,8 +269,30 @@ def main():
 
             optimizer.zero_grad()
             losses = model_train([batch_imgs, batch_boxes, batch_classes])
-            loss = losses[-1]  # total_loss
-            loss.mean().backward()
+            loss = losses[-1].mean()  # total_loss
+
+            # SPNN cycle and reconstruction losses
+            cycle_l = torch.tensor(0.0, device=batch_imgs.device)
+            rec_l = torch.tensor(0.0, device=batch_imgs.device)
+            if opt.lambda_cycle > 0 or opt.lambda_rec > 0:
+                if opt.end_to_end:
+                    spnn = model_train.module.spnn
+                else:
+                    spnn = model_train.module.fcos_body.backbone.spnn
+
+                logits = spnn(batch_imgs)
+                x_inv = spnn.pinv(logits)
+
+                if opt.lambda_cycle > 0:
+                    y_cycle = spnn(x_inv)
+                    cycle_l = (y_cycle - logits).pow(2).mean()
+                    loss = loss + opt.lambda_cycle * cycle_l
+
+                if opt.lambda_rec > 0:
+                    rec_l = (x_inv - batch_imgs).pow(2).mean()
+                    loss = loss + opt.lambda_rec * rec_l
+
+            loss.backward()
 
             # Gradient clipping
             if opt.grad_clip > 0:
@@ -265,39 +306,54 @@ def main():
             lr = optimizer.param_groups[0]['lr']
 
             if GLOBAL_STEPS % 50 == 0 or epoch_step == 0:
-                print(
+                msg = (
                     "global_steps:%d epoch:%d steps:%d/%d cls_loss:%.4f cnt_loss:%.4f "
                     "reg_loss:%.4f cost_time:%dms lr=%.4e total_loss:%.4f" % (
                         GLOBAL_STEPS, epoch + 1, epoch_step + 1, steps_per_epoch,
                         losses[0].mean(), losses[1].mean(), losses[2].mean(),
-                        cost_time, lr, loss.mean(),
+                        cost_time, lr, loss.item(),
                     )
                 )
+                if opt.lambda_cycle > 0 or opt.lambda_rec > 0:
+                    msg += " cycle:%.4f rec:%.4f" % (cycle_l.item(), rec_l.item())
+                print(msg)
 
             if use_wandb:
                 import wandb
-                wandb.log({
+                log_dict = {
                     "train/cls_loss": losses[0].mean().item(),
                     "train/cnt_loss": losses[1].mean().item(),
                     "train/reg_loss": losses[2].mean().item(),
-                    "train/total_loss": loss.mean().item(),
+                    "train/total_loss": loss.item(),
                     "train/lr": lr,
                     "global_step": GLOBAL_STEPS,
-                }, step=GLOBAL_STEPS)
+                }
+                if opt.lambda_cycle > 0:
+                    log_dict["train/cycle_loss"] = cycle_l.item()
+                if opt.lambda_rec > 0:
+                    log_dict["train/rec_loss"] = rec_l.item()
+                wandb.log(log_dict, step=GLOBAL_STEPS)
 
             GLOBAL_STEPS += 1
 
-        # Save checkpoint every epoch
-        torch.save(
-            model_train.state_dict(),
-            os.path.join(opt.save_dir, f"model_{epoch + 1}.pth"),
-        )
+        # # Save checkpoint every epoch
+        # torch.save(
+        #     model_train.state_dict(),
+        #     os.path.join(opt.save_dir, f"model_{epoch + 1}.pth"),
+        # )
 
         # Evaluate
         if (epoch + 1) % opt.eval_freq == 0 or epoch == opt.epochs - 1:
             print(f"\n===== Evaluating at epoch {epoch + 1} =====")
-            # Build inference model and load weights
-            model_eval = FCOSDetector(mode="inference", config=config)
+            # Build inference model without reloading pretrained backbone
+            # (we'll copy trained weights from model_train instead)
+            saved_pretrained = config.spnn_pretrained
+            config.spnn_pretrained = None
+            if opt.end_to_end:
+                model_eval = FCOSDetectorE2E(mode="inference", config=config)
+            else:
+                model_eval = FCOSDetector(mode="inference", config=config)
+            config.spnn_pretrained = saved_pretrained
             model_eval = torch.nn.DataParallel(model_eval)
 
             # Transfer weights from training model to inference model

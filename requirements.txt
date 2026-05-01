@@ -4,15 +4,31 @@
 torch>=2.0.0
 torchvision>=0.15.0
 
-# General
+# General numerical / image / IO
 numpy>=1.23.0
 Pillow>=9.0.0
 tqdm>=4.64.0
 pyyaml>=6.0
 requests>=2.28.0
 
-# Model hub (inference - loading pretrained SPNN checkpoint)
+# Model hub (loading pretrained SPNN / DDNM / classifier checkpoints)
 huggingface-hub>=0.16.0
 
+# Training utilities
+timm>=0.9.0                 # train_efficientnet.py
+accelerate>=0.20.0          # train_voc.py multi-GPU
+wandb>=0.15.0               # optional experiment tracking (train_imagenet.py, train_voc.py, train_det.py, train_detection.py)
+
+# Stable Diffusion generation (generate_sd.py)
+diffusers>=0.25.0
+transformers>=4.30.0
+safetensors>=0.4.0
+
+# Evaluation metrics (compute_metrics.py, compute_sd_metrics.py)
+pytorch-fid>=0.3.0
+torchmetrics[image]>=1.0.0
+lpips>=0.1.4
+scipy>=1.10.0
+
 # Dataset download (optional - only needed if not providing --dataset_path)
-# kagglehub>=0.1.0
+kagglehub>=0.2.0

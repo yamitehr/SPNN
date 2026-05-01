@@ -46,12 +46,20 @@ from models import SPNN, ConvPINNBlock, PixelUnshuffleBlock
 
 
 def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley", scale_bound=2.0):
-    """Build SPNN for classification with the shared backbone architecture."""
+    """Build SPNN for classification with Option C backbone (multi-scale 128+64)."""
     layer_channels = [
-        # Backbone (shared with detection)
-        (PixelUnshuffleBlock, {"r": 4}),
-        (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
+        # Backbone (shared with CenterNet detector)
+        # 128x128 processing
+        (PixelUnshuffleBlock, {"r": 2}),
+        (ConvPINNBlock, {"in_ch": 12, "out_ch": 8, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 128, "mix_type": mix_type}),
+        # 64x64 processing
+        (PixelUnshuffleBlock, {"r": 2}),
+        (ConvPINNBlock, {"in_ch": 32, "out_ch": 28, "hidden": hidden,
                          "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+        (ConvPINNBlock, {"in_ch": 28, "out_ch": 24, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+        # Classification head (below backbone)
         (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
                          "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
         (PixelUnshuffleBlock, {"r": 4}),
@@ -59,7 +67,6 @@ def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley", s
                          "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
         (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
                          "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
-        # Classification head
         (PixelUnshuffleBlock, {"r": 4}),
         (ConvPINNBlock, {"in_ch": 768, "out_ch": 192, "hidden": hidden,
                          "scale_bound": scale_bound, "feat_size": 4, "mix_type": mix_type}),
@@ -69,6 +76,31 @@ def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley", s
         (ConvPINNBlock, {"in_ch": 1024, "out_ch": num_classes, "hidden": hidden,
                          "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
     ]
+
+    # # Previous architecture (PixelUnshuffle(4) backbone):
+    # layer_channels = [
+    #     # Backbone (shared with detection)
+    #     (PixelUnshuffleBlock, {"r": 4}),
+    #     (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
+    #                      "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+    #     (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
+    #                      "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+    #     (PixelUnshuffleBlock, {"r": 4}),
+    #     (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
+    #                      "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+    #     (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
+    #                      "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+    #     # Classification head
+    #     (PixelUnshuffleBlock, {"r": 4}),
+    #     (ConvPINNBlock, {"in_ch": 768, "out_ch": 192, "hidden": hidden,
+    #                      "scale_bound": scale_bound, "feat_size": 4, "mix_type": mix_type}),
+    #     (PixelUnshuffleBlock, {"r": 4}),
+    #     (ConvPINNBlock, {"in_ch": 3072, "out_ch": 1024, "hidden": hidden,
+    #                      "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
+    #     (ConvPINNBlock, {"in_ch": 1024, "out_ch": num_classes, "hidden": hidden,
+    #                      "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
+    # ]
+
     return SPNN(
         img_ch=3, num_classes=num_classes, img_size=256,
         layer_channels=layer_channels,

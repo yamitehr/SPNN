@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import signal
 import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -11,7 +12,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'lib
 
 import numpy as np
 
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.utils.data
 import torch.distributed as dist
 
@@ -22,7 +25,7 @@ from nets.spnn_centernet import get_spnn_centernet
 
 from utils.utils import _tranpose_and_gather_feature, load_model
 from utils.image import transform_preds
-from utils.losses import _neg_loss, _reg_loss
+from utils.losses import _neg_loss, _neg_loss_soft, _reg_loss
 from utils.summary import create_summary, create_logger, create_saver, DisablePrint
 from utils.post_process import ctdet_decode
 
@@ -43,6 +46,35 @@ parser.add_argument('--spnn_backbone', type=str, default=None,
                     help='Path to pretrained SPNN classifier checkpoint for backbone transfer')
 parser.add_argument('--hmap_init_scale', type=float, default=0.01,
                     help='Initial scale for heatmap affine adapter (default: 0.01)')
+parser.add_argument('--hmap_init_bias', type=float, default=-2.19,
+                    help='Initial bias for heatmap affine adapter. CenterNet default '
+                         '-2.19 caps SPNN max sigmoid; try 0.0 to remove the ceiling.')
+parser.add_argument('--head_mode', type=str, default='affine',
+                    choices=['affine', 'orthogonal_mix'],
+                    help='Heatmap head structure (both bijective). '
+                         '"affine": per-class scale + bias only. '
+                         '"orthogonal_mix": adds a learnable C×C orthogonal '
+                         'channel mixer between scale and bias.')
+parser.add_argument('--head_mix_type', type=str, default='householder',
+                    choices=['cayley', 'householder'],
+                    help='Parameterization for the orthogonal_mix head. '
+                         '"householder": product of K reflections, bit-exact '
+                         'orthogonal (best for DDNM round-trips). '
+                         '"cayley": matrix_exp(A−Aᵀ); identity init when A=0.')
+parser.add_argument('--head_mix_reflections', type=int, default=0,
+                    help='Number of Householder reflections (0 → default = '
+                         'num_classes, which covers all of O(C)). Ignored '
+                         'when head_mix_type=cayley.')
+parser.add_argument('--deep_det_head', action='store_true',
+                    help='Use the deeper 3-level U-net t/s/r networks from '
+                         'models_deeper.py for the detector head (block 4) '
+                         'only. Backbone (blocks 0-3) keeps models.py shallow '
+                         'U-net so pretrained backbone weights load cleanly.')
+parser.add_argument('--deep_head_hidden', type=int, default=128,
+                    help='Hidden width for deep_det_head ConvMLPs. With '
+                         'feat_size=64 the deeper U-net is h, 2h, 4h. '
+                         '128 → ~30M extra params; 256 → ~120M extra. '
+                         'Ignored when --deep_det_head is not set.')
 
 parser.add_argument('--img_size', type=int, default=512)
 parser.add_argument('--split_ratio', type=float, default=1.0)
@@ -57,6 +89,19 @@ parser.add_argument('--test_topk', type=int, default=100)
 parser.add_argument('--log_interval', type=int, default=100)
 parser.add_argument('--val_interval', type=int, default=5)
 parser.add_argument('--num_workers', type=int, default=2)
+
+# Distillation from a frozen teacher (e.g., ResNet-18 CenterNet)
+parser.add_argument('--teacher_arch', type=str, default=None,
+                    help='Teacher architecture for distillation (e.g., resnet_18). '
+                         'If None, no distillation.')
+parser.add_argument('--teacher_checkpoint', type=str, default=None,
+                    help='Path to teacher checkpoint (.t7 / .pth)')
+parser.add_argument('--lambda_distill_hmap', type=float, default=1.0,
+                    help='Weight for hmap distillation (MSE in probability space)')
+parser.add_argument('--lambda_distill_regs', type=float, default=1.0,
+                    help='Weight for regs distillation (L1 at GT positions)')
+parser.add_argument('--lambda_distill_wh', type=float, default=0.1,
+                    help='Weight for w_h_ distillation (L1 at GT positions)')
 
 cfg = parser.parse_args()
 
@@ -104,7 +149,9 @@ def main():
                                              num_workers=cfg.num_workers,
                                              pin_memory=True,
                                              drop_last=True,
-                                             sampler=train_sampler if cfg.dist else None)
+                                             sampler=train_sampler if cfg.dist else None,
+                                             persistent_workers=cfg.num_workers > 0,
+                                             prefetch_factor=4)
 
   Dataset_eval = COCO_eval if cfg.dataset == 'coco' else PascalVOC_eval
   val_dataset = Dataset_eval(cfg.data_dir, 'val', test_scales=[1.], test_flip=False)
@@ -120,10 +167,23 @@ def main():
     from nets.resdcn import get_pose_net
     model = get_pose_net(num_layers=int(cfg.arch.split('_')[-1]),
                          head_conv=64, num_classes=train_dataset.num_classes)
+  elif 'resnet' in cfg.arch:
+    # Plain ResNet (no DCN) — uses nets/resnet.py with ImageNet pretrained
+    from nets.resnet import get_pose_net as get_resnet_pose_net
+    model = get_resnet_pose_net(num_layers=int(cfg.arch.split('_')[-1]),
+                                 head_conv=64, num_classes=train_dataset.num_classes)
   elif cfg.arch == 'spnn':
     model = get_spnn_centernet(num_classes=train_dataset.num_classes,
                                pretrained_backbone=cfg.spnn_backbone,
-                               hmap_init_scale=cfg.hmap_init_scale)
+                               hmap_init_scale=cfg.hmap_init_scale,
+                               hmap_init_bias=cfg.hmap_init_bias,
+                               head_mode=cfg.head_mode,
+                               head_mix_type=cfg.head_mix_type,
+                               head_mix_reflections=(cfg.head_mix_reflections
+                                                     if cfg.head_mix_reflections > 0
+                                                     else None),
+                               deep_det_head=cfg.deep_det_head,
+                               deep_head_hidden=cfg.deep_head_hidden)
   else:
     raise NotImplementedError
 
@@ -139,8 +199,60 @@ def main():
   if os.path.isfile(cfg.pretrain_dir):
     model = load_model(model, cfg.pretrain_dir)
 
+  teacher_model = None
+  if cfg.teacher_arch is not None and cfg.teacher_checkpoint is not None:
+    print('Building teacher: %s' % cfg.teacher_arch)
+    if 'resnet' in cfg.teacher_arch:
+      from nets.resnet import get_pose_net as get_resnet_pose_net
+      teacher_model = get_resnet_pose_net(num_layers=int(cfg.teacher_arch.split('_')[-1]),
+                                          head_conv=64, num_classes=train_dataset.num_classes)
+    elif 'resdcn' in cfg.teacher_arch:
+      from nets.resdcn import get_pose_net as get_resdcn_pose_net
+      teacher_model = get_resdcn_pose_net(num_layers=int(cfg.teacher_arch.split('_')[-1]),
+                                          head_conv=64, num_classes=train_dataset.num_classes)
+    else:
+      raise NotImplementedError('Teacher arch %s not supported' % cfg.teacher_arch)
+
+    raw_t = torch.load(cfg.teacher_checkpoint, map_location='cpu', weights_only=False)
+    if isinstance(raw_t, dict) and 'state_dict' in raw_t:
+      t_state = raw_t['state_dict']
+    elif isinstance(raw_t, dict) and 'model' in raw_t:
+      t_state = raw_t['model']
+    else:
+      t_state = raw_t
+    t_state = {k[7:] if k.startswith('module.') else k: v for k, v in t_state.items()}
+    missing, unexpected = teacher_model.load_state_dict(t_state, strict=False)
+    print('[teacher] Loaded %s from %s (missing=%d, unexpected=%d)' %
+          (cfg.teacher_arch, cfg.teacher_checkpoint, len(missing), len(unexpected)))
+    teacher_model = teacher_model.to(cfg.device)
+    teacher_model.eval()
+    for p in teacher_model.parameters():
+      p.requires_grad_(False)
+    if not cfg.dist:
+      teacher_model = nn.DataParallel(teacher_model)
+
   optimizer = torch.optim.Adam(model.parameters(), cfg.lr)
   lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, cfg.lr_step, gamma=0.1)
+
+  current_epoch = [0]
+
+  def _save_and_exit(signum, frame):
+    try:
+      ckpt_path = os.path.join(cfg.ckpt_dir, 'preempt_checkpoint.pth')
+      tmp = ckpt_path + '.tmp'
+      m = model.module if hasattr(model, 'module') else model
+      torch.save({
+        'model': m.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'epoch': current_epoch[0],
+      }, tmp)
+      os.replace(tmp, ckpt_path)
+      print('[preempt] checkpoint saved to %s at epoch %d' % (ckpt_path, current_epoch[0]), flush=True)
+    except Exception as e:
+      print('[preempt] checkpoint save failed: %s' % e, flush=True)
+    sys.exit(0)
+
+  signal.signal(signal.SIGTERM, _save_and_exit)
 
   def train(epoch):
     print('\n Epoch: %d' % epoch)
@@ -161,6 +273,28 @@ def main():
       w_h_loss = _reg_loss(w_h_, batch['w_h_'], batch['ind_masks'])
       loss = hmap_loss + 1 * reg_loss + 0.1 * w_h_loss
 
+      d_hmap_val = d_regs_val = d_wh_val = 0.0
+      if teacher_model is not None:
+        with torch.no_grad():
+          t_outputs = teacher_model(batch['image'])
+        t_hmap, t_regs, t_w_h_ = zip(*t_outputs)
+        t_regs_g = [_tranpose_and_gather_feature(r, batch['inds']).detach() for r in t_regs]
+        t_w_h_g = [_tranpose_and_gather_feature(r, batch['inds']).detach() for r in t_w_h_]
+
+        # Soft focal loss with teacher's sigmoid hmap as soft target.
+        # Magnitude is comparable to supervised hmap_loss, so lambda~1.0 works.
+        t_hmap_soft = [t.sigmoid().detach() for t in t_hmap]
+        d_hmap = _neg_loss_soft(hmap, t_hmap_soft[0])
+        d_regs = _reg_loss(regs, t_regs_g[0], batch['ind_masks'])
+        d_wh = _reg_loss(w_h_, t_w_h_g[0], batch['ind_masks'])
+
+        loss = (loss + cfg.lambda_distill_hmap * d_hmap
+                + cfg.lambda_distill_regs * d_regs
+                + cfg.lambda_distill_wh * d_wh)
+        d_hmap_val = d_hmap.item()
+        d_regs_val = d_regs.item()
+        d_wh_val = d_wh.item()
+
       optimizer.zero_grad()
       loss.backward()
       optimizer.step()
@@ -168,15 +302,22 @@ def main():
       if batch_idx % cfg.log_interval == 0:
         duration = time.perf_counter() - tic
         tic = time.perf_counter()
-        print('[%d/%d-%d/%d] ' % (epoch, cfg.num_epochs, batch_idx, len(train_loader)) +
-              ' hmap_loss= %.5f reg_loss= %.5f w_h_loss= %.5f' %
-              (hmap_loss.item(), reg_loss.item(), w_h_loss.item()) +
-              ' (%d samples/sec)' % (cfg.batch_size * cfg.log_interval / duration))
+        msg = ('[%d/%d-%d/%d] ' % (epoch, cfg.num_epochs, batch_idx, len(train_loader)) +
+               ' hmap_loss= %.5f reg_loss= %.5f w_h_loss= %.5f' %
+               (hmap_loss.item(), reg_loss.item(), w_h_loss.item()))
+        if teacher_model is not None:
+          msg += ' d_hmap= %.5f d_reg= %.5f d_wh= %.5f' % (d_hmap_val, d_regs_val, d_wh_val)
+        msg += ' (%d samples/sec)' % (cfg.batch_size * cfg.log_interval / duration)
+        print(msg)
 
         step = len(train_loader) * epoch + batch_idx
         summary_writer.add_scalar('hmap_loss', hmap_loss.item(), step)
         summary_writer.add_scalar('reg_loss', reg_loss.item(), step)
         summary_writer.add_scalar('w_h_loss', w_h_loss.item(), step)
+        if teacher_model is not None:
+          summary_writer.add_scalar('distill/hmap', d_hmap_val, step)
+          summary_writer.add_scalar('distill/regs', d_regs_val, step)
+          summary_writer.add_scalar('distill/wh', d_wh_val, step)
     return
 
   def val_map(epoch):
@@ -233,6 +374,7 @@ def main():
 
   print('Starting training...')
   for epoch in range(1, cfg.num_epochs + 1):
+    current_epoch[0] = epoch
     train_sampler.set_epoch(epoch)
     train(epoch)
     if cfg.val_interval > 0 and epoch % cfg.val_interval == 0:

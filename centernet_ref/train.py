@@ -103,6 +103,13 @@ parser.add_argument('--lambda_distill_regs', type=float, default=1.0,
 parser.add_argument('--lambda_distill_wh', type=float, default=0.1,
                     help='Weight for w_h_ distillation (L1 at GT positions)')
 
+# wandb logging (rank 0 only)
+parser.add_argument('--wandb', action='store_true', help='Enable wandb logging')
+parser.add_argument('--wandb_project', type=str, default='spnn-centernet',
+                    help='wandb project name')
+parser.add_argument('--wandb_run_name', type=str, default=None,
+                    help='wandb run name (defaults to --log_name)')
+
 cfg = parser.parse_args()
 
 os.chdir(cfg.root_dir)
@@ -123,6 +130,14 @@ def main():
   summary_writer = create_summary(cfg.local_rank, log_dir=cfg.log_dir)
   print = logger.info
   print(cfg)
+
+  wandb_run = None
+  if cfg.wandb and cfg.local_rank == 0:
+    import wandb
+    wandb_run = wandb.init(project=cfg.wandb_project,
+                           name=cfg.wandb_run_name or cfg.log_name,
+                           config=vars(cfg),
+                           dir=cfg.log_dir)
 
   torch.manual_seed(317)
   torch.backends.cudnn.benchmark = True  # disable this if OOM at beginning of training
@@ -318,6 +333,22 @@ def main():
           summary_writer.add_scalar('distill/hmap', d_hmap_val, step)
           summary_writer.add_scalar('distill/regs', d_regs_val, step)
           summary_writer.add_scalar('distill/wh', d_wh_val, step)
+
+        if wandb_run is not None:
+          wandb_log = {
+            'train/hmap_loss': hmap_loss.item(),
+            'train/reg_loss': reg_loss.item(),
+            'train/w_h_loss': w_h_loss.item(),
+            'train/total_loss': loss.item(),
+            'train/lr': optimizer.param_groups[0]['lr'],
+            'train/step': step,
+            'epoch': epoch,
+          }
+          if teacher_model is not None:
+            wandb_log['train/distill_hmap'] = d_hmap_val
+            wandb_log['train/distill_regs'] = d_regs_val
+            wandb_log['train/distill_wh'] = d_wh_val
+          wandb_run.log(wandb_log)
     return
 
   def val_map(epoch):
@@ -371,6 +402,7 @@ def main():
     eval_results = val_dataset.run_eval(results, save_dir=cfg.ckpt_dir)
     print(eval_results)
     summary_writer.add_scalar('val_mAP/mAP', eval_results[0], epoch)
+    return eval_results
 
   print('Starting training...')
   for epoch in range(1, cfg.num_epochs + 1):
@@ -378,11 +410,20 @@ def main():
     train_sampler.set_epoch(epoch)
     train(epoch)
     if cfg.val_interval > 0 and epoch % cfg.val_interval == 0:
-      val_map(epoch)
+      eval_results = val_map(epoch)
+      if wandb_run is not None and eval_results is not None:
+        wandb_log = {'val/mAP': float(eval_results[0]), 'epoch': epoch}
+        if cfg.dataset == 'pascal' and len(eval_results) > 1:
+          from centernet_datasets.pascal import VOC_NAMES
+          for cls_name, ap in zip(VOC_NAMES[1:], eval_results[1]):
+            wandb_log['val/AP_%s' % cls_name] = float(ap)
+        wandb_run.log(wandb_log)
     print(saver.save(model.module.state_dict(), 'checkpoint'))
     lr_scheduler.step(epoch)  # move to here after pytorch1.1.0
 
   summary_writer.close()
+  if wandb_run is not None:
+    wandb_run.finish()
 
 
 if __name__ == '__main__':

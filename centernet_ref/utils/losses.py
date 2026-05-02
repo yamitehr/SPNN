@@ -62,3 +62,31 @@ def _reg_loss(regs, gt_regs, mask):
   mask = mask[:, :, None].expand_as(gt_regs).float()
   loss = sum(F.l1_loss(r * mask, gt_regs * mask, reduction='sum') / (mask.sum() + 1e-4) for r in regs)
   return loss / len(regs)
+
+
+def _neg_loss_soft(preds, targets):
+  ''' CornerNet-style focal loss with soft targets in [0, 1].
+
+  Differs from `_neg_loss` only in how positives are weighted: instead of
+  `(targets == 1)` (which assumes Gaussian-encoded GT with exact peaks),
+  the per-cell positive weight is the soft target itself, and the negative
+  weight is `(1 - targets)`. This lets us use a teacher's `sigmoid(hmap)`
+  prediction as a soft GT for distillation.
+
+  When `targets` happens to be a hard 0/1 heatmap, this reduces to the
+  standard focal loss.
+
+  Arguments:
+    preds: list of (B, C, H, W) raw logits
+    targets: (B, C, H, W) soft probabilities in [0, 1]
+  '''
+  neg_weights = torch.pow(1 - targets, 4)
+  loss = 0
+  for pred in preds:
+    pred = torch.clamp(torch.sigmoid(pred), min=1e-4, max=1 - 1e-4)
+    pos_loss = targets * torch.log(pred) * torch.pow(1 - pred, 2)
+    neg_loss = (1 - targets) * torch.log(1 - pred) * torch.pow(pred, 2) * neg_weights
+
+    num_pos = targets.sum().clamp(min=1.0)
+    loss = loss - (pos_loss.sum() + neg_loss.sum()) / num_pos
+  return loss / len(preds)

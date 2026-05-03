@@ -2,6 +2,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def _gn_groups(channels: int, max_groups: int = 32) -> int:
+    """Largest divisor of `channels` that is <= max_groups, for nn.GroupNorm."""
+    for g in (max_groups, 16, 8, 4, 2, 1):
+        if channels % g == 0:
+            return g
+    return 1
+
 class BaseOrthogonal1x1Conv(nn.Module):
     """
     Base class for orthogonal 1x1 convolutions.
@@ -483,19 +491,27 @@ class ConvMLP(nn.Module):
             h2 = min(h1 * 2, 2048)
             h3 = min(h2 * 2, 4096)
             if feat_size is not None and feat_size >= 4 and feat_size % 4 == 0:
-                # Deeper U-net: 3 levels (feat_size, feat_size/2, feat_size/4)
+                # Deeper U-net: 3 levels (feat_size, feat_size/2, feat_size/4).
+                # GroupNorm after every internal conv keeps intermediate
+                # activations on a bounded scale. Bijectivity of the enclosing
+                # ConvPINNBlock is preserved: s/t/r are arbitrary deterministic
+                # functions used inside y = x0*s(x1) + t(x1) — the inverse
+                # re-uses the same s/t outputs, so any internal normalization
+                # layer is fine. Final conv stays zero-init (no GN/ReLU after)
+                # so the warm-start "head ≈ identity at init" is intact.
+                g1, g2, g3 = _gn_groups(h1), _gn_groups(h2), _gn_groups(h3)
                 self.net = nn.Sequential(
-                    nn.Conv2d(in_ch, h1, 3, padding=1), nn.ReLU(),
-                    nn.Conv2d(h1, h1, 3, padding=1), nn.ReLU(),
-                    nn.Conv2d(h1, h2, 3, stride=2, padding=1), nn.ReLU(),  # feat → feat/2
-                    nn.Conv2d(h2, h2, 3, padding=1), nn.ReLU(),
-                    nn.Conv2d(h2, h3, 3, stride=2, padding=1), nn.ReLU(),  # feat/2 → feat/4
-                    nn.Conv2d(h3, h3, 3, padding=1), nn.ReLU(),
-                    nn.Conv2d(h3, h3, 3, padding=1), nn.ReLU(),  # bottleneck
-                    nn.ConvTranspose2d(h3, h2, 4, stride=2, padding=1), nn.ReLU(),  # feat/4 → feat/2
-                    nn.Conv2d(h2, h2, 3, padding=1), nn.ReLU(),
-                    nn.ConvTranspose2d(h2, h1, 4, stride=2, padding=1), nn.ReLU(),  # feat/2 → feat
-                    nn.Conv2d(h1, h1, 3, padding=1), nn.ReLU(),
+                    nn.Conv2d(in_ch, h1, 3, padding=1), nn.GroupNorm(g1, h1), nn.ReLU(),
+                    nn.Conv2d(h1, h1, 3, padding=1), nn.GroupNorm(g1, h1), nn.ReLU(),
+                    nn.Conv2d(h1, h2, 3, stride=2, padding=1), nn.GroupNorm(g2, h2), nn.ReLU(),  # feat → feat/2
+                    nn.Conv2d(h2, h2, 3, padding=1), nn.GroupNorm(g2, h2), nn.ReLU(),
+                    nn.Conv2d(h2, h3, 3, stride=2, padding=1), nn.GroupNorm(g3, h3), nn.ReLU(),  # feat/2 → feat/4
+                    nn.Conv2d(h3, h3, 3, padding=1), nn.GroupNorm(g3, h3), nn.ReLU(),
+                    nn.Conv2d(h3, h3, 3, padding=1), nn.GroupNorm(g3, h3), nn.ReLU(),  # bottleneck
+                    nn.ConvTranspose2d(h3, h2, 4, stride=2, padding=1), nn.GroupNorm(g2, h2), nn.ReLU(),  # feat/4 → feat/2
+                    nn.Conv2d(h2, h2, 3, padding=1), nn.GroupNorm(g2, h2), nn.ReLU(),
+                    nn.ConvTranspose2d(h2, h1, 4, stride=2, padding=1), nn.GroupNorm(g1, h1), nn.ReLU(),  # feat/2 → feat
+                    nn.Conv2d(h1, h1, 3, padding=1), nn.GroupNorm(g1, h1), nn.ReLU(),
                     nn.Conv2d(h1, out_ch, 3, padding=1),
                 )
             elif feat_size is not None and feat_size > 1:

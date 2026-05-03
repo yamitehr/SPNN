@@ -90,6 +90,12 @@ parser.add_argument('--two_block_head', action='store_true',
                          'channels (vs x1=4 for the single-block variant). '
                          'Backbone (blocks 0-3) is unchanged and still '
                          'transfers fully from the classifier.')
+parser.add_argument('--freeze_backbone', action='store_true',
+                    help='Freeze the SPNN backbone (blocks 0-3, transferred '
+                         'from the classifier) by detaching the tensor '
+                         'between backbone and head during forward. Only the '
+                         'head ConvPINN block(s) and the affine adapter / '
+                         'orthogonal mixer receive gradients.')
 parser.add_argument('--warm_start_full', type=str, default=None,
                     help='Path to a full SPNN-CenterNet checkpoint.t7 to '
                          'warm-start the entire model from (loaded with '
@@ -242,7 +248,8 @@ def main():
                                deep_det_head=cfg.deep_det_head,
                                deep_head_hidden=cfg.deep_head_hidden,
                                mlp_tail_hidden=cfg.mlp_tail_hidden,
-                               two_block_head=cfg.two_block_head)
+                               two_block_head=cfg.two_block_head,
+                               freeze_backbone=cfg.freeze_backbone)
   else:
     raise NotImplementedError
 

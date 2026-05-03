@@ -130,7 +130,8 @@ class SPNNCenterNet(nn.Module):
     def __init__(self, spnn, num_classes=20, hmap_init_scale=0.01,
                  hmap_init_bias=-2.19,
                  head_mode='affine', head_mix_type='householder',
-                 head_mix_reflections=None):
+                 head_mix_reflections=None,
+                 freeze_backbone=False, num_backbone_blocks=4):
         super().__init__()
         self.spnn = spnn
         self.num_classes = num_classes
@@ -138,6 +139,11 @@ class SPNNCenterNet(nn.Module):
             raise ValueError(f"Unknown head_mode={head_mode!r}; "
                              f"expected 'affine' or 'orthogonal_mix'")
         self.head_mode = head_mode
+        # Backbone-freeze config: when True, forward iterates blocks manually
+        # and detaches the tensor between block index `num_backbone_blocks - 1`
+        # and the head, so gradients flow only into head blocks + adapter.
+        self.freeze_backbone = freeze_backbone
+        self.num_backbone_blocks = num_backbone_blocks
         self.hmap_scale = nn.Parameter(torch.ones(1, num_classes, 1, 1) * hmap_init_scale)
         self.hmap_bias = nn.Parameter(torch.full((1, num_classes, 1, 1), float(hmap_init_bias)))
         if head_mode == 'orthogonal_mix':
@@ -152,8 +158,28 @@ class SPNNCenterNet(nn.Module):
                                  f"expected 'cayley' or 'householder'")
             self.head_mix_type = head_mix_type
 
+    def _spnn_forward_with_freeze(self, x):
+        """Manual block iteration that detaches between backbone and head.
+
+        Equivalent to self.spnn(x) but with .detach() inserted after the last
+        backbone block. Backbone params still build the autograd graph but
+        receive no gradient (their .grad stays None after backward); head
+        blocks + adapter still train normally.
+        """
+        h = x
+        blocks = self.spnn.pinn.blocks
+        for block in blocks[:self.num_backbone_blocks]:
+            h, _ = block(h, return_latent=False)
+        h = h.detach()
+        for block in blocks[self.num_backbone_blocks:]:
+            h, _ = block(h, return_latent=False)
+        return h  # output_spatial_size is set, so SPNN skips the .view step
+
     def forward(self, x):
-        raw = self.spnn(x)  # [B, num_classes+4, H/4, W/4]
+        if self.freeze_backbone:
+            raw = self._spnn_forward_with_freeze(x)
+        else:
+            raw = self.spnn(x)  # [B, num_classes+4, H/4, W/4]
         hmap_raw = raw[:, :self.num_classes]
         hmap = hmap_raw * self.hmap_scale  # per-channel rescale
         if self.head_mode == 'orthogonal_mix':
@@ -182,7 +208,8 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
                          head_mix_reflections=None,
                          deep_det_head=False, deep_head_hidden=128,
                          mlp_tail_hidden=0,
-                         two_block_head=False):
+                         two_block_head=False,
+                         freeze_backbone=False):
     """Build end-to-end invertible SPNN for CenterNet detection.
 
     Architecture (Option C: multi-scale 128+64):
@@ -248,12 +275,17 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
     if pretrained_backbone is not None:
         transfer_backbone_from_classifier(pretrained_backbone, spnn)
 
+    # Backbone is always indices 0-3 (PU + ConvPINN + PU + ConvPINN); head is
+    # everything after.  The two_block_head flag only adds head blocks past
+    # this boundary, so num_backbone_blocks=4 covers both head variants.
     return SPNNCenterNet(spnn, num_classes=num_classes,
                          hmap_init_scale=hmap_init_scale,
                          hmap_init_bias=hmap_init_bias,
                          head_mode=head_mode,
                          head_mix_type=head_mix_type,
-                         head_mix_reflections=head_mix_reflections)
+                         head_mix_reflections=head_mix_reflections,
+                         freeze_backbone=freeze_backbone,
+                         num_backbone_blocks=4)
 
 
 def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
@@ -263,7 +295,8 @@ def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
                        head_mix_reflections=None,
                        deep_det_head=False, deep_head_hidden=128,
                        mlp_tail_hidden=0,
-                       two_block_head=False):
+                       two_block_head=False,
+                       freeze_backbone=False):
     """Entry point matching CenterNet's model creation pattern."""
     return build_spnn_centernet(num_classes=num_classes,
                                 pretrained_backbone=pretrained_backbone,
@@ -275,4 +308,5 @@ def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
                                 deep_det_head=deep_det_head,
                                 deep_head_hidden=deep_head_hidden,
                                 mlp_tail_hidden=mlp_tail_hidden,
-                                two_block_head=two_block_head)
+                                two_block_head=two_block_head,
+                                freeze_backbone=freeze_backbone)

@@ -531,12 +531,18 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, schedu
         output = model(images)
         ce_loss = criterion(output, target)
 
-        # SPNN cycle losses
+        # SPNN cycle losses (skip computations whose lambda is 0 to save memory)
         spnn_model = model.module if hasattr(model, 'module') else model
-        x_inv = spnn_model.pinv(output)
-        y_cycle = model(x_inv)
-        cycle_loss = (y_cycle - output).pow(2).mean()
-        rec_loss = (x_inv - images).pow(2).mean()
+        if args.lambda_cycle > 0 or args.lambda_rec > 0:
+            x_inv = spnn_model.pinv(output)
+            rec_loss = (x_inv - images).pow(2).mean()
+        else:
+            rec_loss = torch.zeros((), device=output.device)
+        if args.lambda_cycle > 0:
+            y_cycle = model(x_inv)
+            cycle_loss = (y_cycle - output).pow(2).mean()
+        else:
+            cycle_loss = torch.zeros((), device=output.device)
 
         loss = ce_loss + args.lambda_cycle * cycle_loss + args.lambda_rec * rec_loss
 

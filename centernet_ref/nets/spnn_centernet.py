@@ -37,17 +37,26 @@ class _DeepHeadConvPINNBlock(ConvPINNBlock):
     """
 
     def __init__(self, in_ch, out_ch, hidden=64, scale_bound=2.,
-                 img_size=32, mix_type="householder", feat_size=None):
+                 img_size=32, mix_type="householder", feat_size=None,
+                 mlp_tail_hidden=0):
         super().__init__(in_ch=in_ch, out_ch=out_ch, hidden=hidden,
                          scale_bound=scale_bound, img_size=img_size,
                          mix_type=mix_type, feat_size=feat_size)
-        # Replace shallow t/s/r with the deeper variant.
+        # Replace shallow t/s/r with the deeper variant.  When
+        # mlp_tail_hidden > 0, each ConvMLP appends a per-pixel MLP residual
+        # after its U-net (zero-init last conv → identity at step 0), adding
+        # nonlinear channel-direction capacity inside s/t/r.  Bijectivity is
+        # unchanged: the coupling y = x0 * s(x1) + t(x1) is invertible for any
+        # deterministic s, t — the tail just makes them deeper.
         self.t = _DeeperConvMLP(in_ch - out_ch, out_ch, None, hidden,
-                                img_size=img_size, feat_size=feat_size)
+                                img_size=img_size, feat_size=feat_size,
+                                mlp_tail_hidden=mlp_tail_hidden)
         self.s = _DeeperConvMLP(in_ch - out_ch, out_ch, scale_bound, hidden,
-                                img_size=img_size, feat_size=feat_size)
+                                img_size=img_size, feat_size=feat_size,
+                                mlp_tail_hidden=mlp_tail_hidden)
         self.r = _DeeperConvMLP(out_ch, in_ch - out_ch, None, hidden,
-                                img_size=img_size, feat_size=feat_size)
+                                img_size=img_size, feat_size=feat_size,
+                                mlp_tail_hidden=mlp_tail_hidden)
 
 
 def transfer_backbone_from_classifier(cls_checkpoint_path, spnn_model):
@@ -171,15 +180,23 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
                          head_mode='affine',
                          head_mix_type='householder',
                          head_mix_reflections=None,
-                         deep_det_head=False, deep_head_hidden=128):
+                         deep_det_head=False, deep_head_hidden=128,
+                         mlp_tail_hidden=0,
+                         two_block_head=False):
     """Build end-to-end invertible SPNN for CenterNet detection.
 
-    Architecture (Option C: multi-scale 128+64 with 3 backbone blocks):
+    Architecture (Option C: multi-scale 128+64):
       [3, 256, 256] -> PixelUnshuffle(2) -> [12, 128, 128]
                     -> ConvPINNBlock(12 -> 8)  -> [8, 128, 128]    x1=4
                     -> PixelUnshuffle(2) -> [32, 64, 64]
                     -> ConvPINNBlock(32 -> 28) -> [28, 64, 64]     x1=4
-                    -> ConvPINNBlock(28 -> 24) -> [24, 64, 64]     x1=4  [detector head, random init]
+
+    Detector head (random init, not transferred from classifier):
+      two_block_head=False (default):
+                    -> ConvPINNBlock(28 -> 24) -> [24, 64, 64]     x1=4
+      two_block_head=True:
+                    -> ConvPINNBlock(28 -> 26) -> [26, 64, 64]     x1=2
+                    -> ConvPINNBlock(26 -> 24) -> [24, 64, 64]     x1=2
 
     Output: [num_classes+4, 64, 64] at stride 4
       channels 0:num_classes  = class heatmaps
@@ -187,6 +204,17 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
       channels +2:+4          = width, height
     """
     out_ch = num_classes + 4  # 20 + 4 = 24 for VOC
+
+    def _head_block(in_ch_b, out_ch_b):
+        """Build one detector-head ConvPINN block, deep variant if requested."""
+        cls = _DeepHeadConvPINNBlock if deep_det_head else ConvPINNBlock
+        kwargs = {"in_ch": in_ch_b, "out_ch": out_ch_b,
+                  "hidden": deep_head_hidden if deep_det_head else hidden,
+                  "scale_bound": scale_bound, "feat_size": 64,
+                  "mix_type": mix_type}
+        if deep_det_head:
+            kwargs["mlp_tail_hidden"] = mlp_tail_hidden
+        return (cls, kwargs)
 
     layer_channels = [
         # 128x128 processing (fine spatial detail)
@@ -199,16 +227,15 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
         (ConvPINNBlock, {"in_ch": 32, "out_ch": 28, "hidden": hidden,
                          "scale_bound": scale_bound, "feat_size": 64,
                          "mix_type": mix_type}),
-        # Detector head — random init (not transferred from classifier)
-        # When deep_det_head=True, this block uses the deeper U-net t/s/r
-        # nets from models_deeper.py (h1=h, h2=2h, h3=4h, ~4× param count
-        # at hidden=128 vs the shallow variant at hidden=256).
-        ((_DeepHeadConvPINNBlock if deep_det_head else ConvPINNBlock),
-         {"in_ch": 28, "out_ch": out_ch,
-          "hidden": (deep_head_hidden if deep_det_head else hidden),
-          "scale_bound": scale_bound, "feat_size": 64,
-          "mix_type": mix_type}),
     ]
+    # Detector head — random init (not transferred from classifier).
+    # When deep_det_head=True, head blocks use the deeper U-net t/s/r nets
+    # from models_deeper.py.
+    if two_block_head:
+        layer_channels.append(_head_block(28, 26))
+        layer_channels.append(_head_block(26, out_ch))
+    else:
+        layer_channels.append(_head_block(28, out_ch))
 
     spnn = SPNN(
         img_ch=3,
@@ -234,7 +261,9 @@ def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
                        head_mode='affine',
                        head_mix_type='householder',
                        head_mix_reflections=None,
-                       deep_det_head=False, deep_head_hidden=128):
+                       deep_det_head=False, deep_head_hidden=128,
+                       mlp_tail_hidden=0,
+                       two_block_head=False):
     """Entry point matching CenterNet's model creation pattern."""
     return build_spnn_centernet(num_classes=num_classes,
                                 pretrained_backbone=pretrained_backbone,
@@ -244,4 +273,6 @@ def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
                                 head_mix_type=head_mix_type,
                                 head_mix_reflections=head_mix_reflections,
                                 deep_det_head=deep_det_head,
-                                deep_head_hidden=deep_head_hidden)
+                                deep_head_hidden=deep_head_hidden,
+                                mlp_tail_hidden=mlp_tail_hidden,
+                                two_block_head=two_block_head)

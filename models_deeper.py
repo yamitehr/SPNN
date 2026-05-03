@@ -10,6 +10,58 @@ def _gn_groups(channels: int, max_groups: int = 32) -> int:
             return g
     return 1
 
+
+class _UNet3Skip(nn.Module):
+    """3-level U-net with concat skip connections (feat → /2 → /4 → /8 → /4 → /2 → feat).
+    Final conv is zero-init so the block warm-starts as identity, matching the
+    Sequential branches' init contract.
+    """
+    def __init__(self, in_ch, out_ch, h1, h2, h3, h4):
+        super().__init__()
+        g1, g2, g3, g4 = _gn_groups(h1), _gn_groups(h2), _gn_groups(h3), _gn_groups(h4)
+        def _enc(ci, co, g, stride):
+            return nn.Sequential(
+                nn.Conv2d(ci, co, 3, stride=stride, padding=1), nn.GroupNorm(g, co), nn.ReLU(),
+                nn.Conv2d(co, co, 3, padding=1), nn.GroupNorm(g, co), nn.ReLU())
+        def _up(ci, co, g):
+            return nn.Sequential(
+                nn.ConvTranspose2d(ci, co, 4, 2, 1), nn.GroupNorm(g, co), nn.ReLU())
+        def _dec(c, g):  # input channels are 2*c after skip-concat
+            return nn.Sequential(
+                nn.Conv2d(2 * c, c, 3, padding=1), nn.GroupNorm(g, c), nn.ReLU())
+        self.enc1, self.enc2 = _enc(in_ch, h1, g1, 1), _enc(h1, h2, g2, 2)
+        self.enc3, self.enc4 = _enc(h2, h3, g3, 2), _enc(h3, h4, g4, 2)
+        self.up3, self.up2, self.up1 = _up(h4, h3, g3), _up(h3, h2, g2), _up(h2, h1, g1)
+        self.dec3, self.dec2, self.dec1 = _dec(h3, g3), _dec(h2, g2), _dec(h1, g1)
+        self.final = nn.Conv2d(h1, out_ch, 3, padding=1)
+        nn.init.zeros_(self.final.weight)
+        nn.init.zeros_(self.final.bias)
+
+    def forward(self, x):
+        e1 = self.enc1(x); e2 = self.enc2(e1); e3 = self.enc3(e2); b = self.enc4(e3)
+        d3 = self.dec3(torch.cat([self.up3(b),  e3], dim=1))
+        d2 = self.dec2(torch.cat([self.up2(d3), e2], dim=1))
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=1))
+        return self.final(d1)
+
+
+def _build_mlp_tail(channels: int, hidden: int) -> nn.Sequential:
+    """Per-pixel MLP applied to a (B, channels, H, W) tensor.
+    Last 1×1 conv is zero-init so the tail outputs all-zeros at construction;
+    callers add it as a residual: x = x + tail(x), so init behavior is identity.
+    """
+    g_h = _gn_groups(hidden)
+    final = nn.Conv2d(hidden, channels, kernel_size=1)
+    nn.init.zeros_(final.weight)
+    nn.init.zeros_(final.bias)
+    return nn.Sequential(
+        nn.Conv2d(channels, hidden, kernel_size=1),
+        nn.GroupNorm(g_h, hidden), nn.GELU(),
+        nn.Conv2d(hidden, hidden, kernel_size=1),
+        nn.GroupNorm(g_h, hidden), nn.GELU(),
+        final,
+    )
+
 class BaseOrthogonal1x1Conv(nn.Module):
     """
     Base class for orthogonal 1x1 convolutions.
@@ -255,12 +307,16 @@ class PatchHouseholderMix(BasePatchOrthogonalMix):
 
 
 class ConvMLP(nn.Module):
-    def __init__(self, in_ch, out_ch, scale_bound, hidden_ch, img_size: int = 32, feat_size: int = None):
+    def __init__(self, in_ch, out_ch, scale_bound, hidden_ch, img_size: int = 32,
+                 feat_size: int = None, mlp_tail_hidden: int = 0):
         super().__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
         self.scale_bound = scale_bound
         self.img_size = img_size
+        # Optional per-pixel MLP applied as a residual on top of self.net's output.
+        # Built below after self.net, since we need out_ch (which is well-defined here).
+        self.mlp_tail_hidden = mlp_tail_hidden
 
         # ===== img_size=256: Block1 (64x64) =====
         if self.img_size == 256 and in_ch == 36 and out_ch == 12:
@@ -490,30 +546,17 @@ class ConvMLP(nn.Module):
             h1 = min(max(hidden_ch, in_ch), 1024)
             h2 = min(h1 * 2, 2048)
             h3 = min(h2 * 2, 4096)
-            if feat_size is not None and feat_size >= 4 and feat_size % 4 == 0:
-                # Deeper U-net: 3 levels (feat_size, feat_size/2, feat_size/4).
-                # GroupNorm after every internal conv keeps intermediate
-                # activations on a bounded scale. Bijectivity of the enclosing
+            if feat_size is not None and feat_size >= 8 and feat_size % 8 == 0:
+                # Deeper U-net: 4 levels with concat skip connections
+                # (feat → feat/2 → feat/4 → feat/8 bottleneck → feat/4 → feat/2 → feat).
+                # Skip connections concatenate encoder activations into the
+                # matching decoder stage. Bijectivity of the enclosing
                 # ConvPINNBlock is preserved: s/t/r are arbitrary deterministic
                 # functions used inside y = x0*s(x1) + t(x1) — the inverse
-                # re-uses the same s/t outputs, so any internal normalization
-                # layer is fine. Final conv stays zero-init (no GN/ReLU after)
-                # so the warm-start "head ≈ identity at init" is intact.
-                g1, g2, g3 = _gn_groups(h1), _gn_groups(h2), _gn_groups(h3)
-                self.net = nn.Sequential(
-                    nn.Conv2d(in_ch, h1, 3, padding=1), nn.GroupNorm(g1, h1), nn.ReLU(),
-                    nn.Conv2d(h1, h1, 3, padding=1), nn.GroupNorm(g1, h1), nn.ReLU(),
-                    nn.Conv2d(h1, h2, 3, stride=2, padding=1), nn.GroupNorm(g2, h2), nn.ReLU(),  # feat → feat/2
-                    nn.Conv2d(h2, h2, 3, padding=1), nn.GroupNorm(g2, h2), nn.ReLU(),
-                    nn.Conv2d(h2, h3, 3, stride=2, padding=1), nn.GroupNorm(g3, h3), nn.ReLU(),  # feat/2 → feat/4
-                    nn.Conv2d(h3, h3, 3, padding=1), nn.GroupNorm(g3, h3), nn.ReLU(),
-                    nn.Conv2d(h3, h3, 3, padding=1), nn.GroupNorm(g3, h3), nn.ReLU(),  # bottleneck
-                    nn.ConvTranspose2d(h3, h2, 4, stride=2, padding=1), nn.GroupNorm(g2, h2), nn.ReLU(),  # feat/4 → feat/2
-                    nn.Conv2d(h2, h2, 3, padding=1), nn.GroupNorm(g2, h2), nn.ReLU(),
-                    nn.ConvTranspose2d(h2, h1, 4, stride=2, padding=1), nn.GroupNorm(g1, h1), nn.ReLU(),  # feat/2 → feat
-                    nn.Conv2d(h1, h1, 3, padding=1), nn.GroupNorm(g1, h1), nn.ReLU(),
-                    nn.Conv2d(h1, out_ch, 3, padding=1),
-                )
+                # re-uses the same s/t outputs. Final conv is zero-init inside
+                # _UNet3Skip so the warm-start "head ≈ identity" is intact.
+                h4 = min(h3 * 2, 8192)
+                self.net = _UNet3Skip(in_ch, out_ch, h1, h2, h3, h4)
             elif feat_size is not None and feat_size > 1:
                 assert feat_size % 2 == 0, (
                     f"feat_size must be even when using the stride-2 path (got feat_size={feat_size}). "
@@ -545,16 +588,33 @@ class ConvMLP(nn.Module):
                     nn.Conv2d(h2, h1, 3, padding=1), nn.ReLU(),
                     nn.Conv2d(h1, out_ch, 3, padding=1),
                 )
-            nn.init.zeros_(self.net[-1].weight)
-            nn.init.zeros_(self.net[-1].bias)
+            if isinstance(self.net, nn.Sequential):
+                nn.init.zeros_(self.net[-1].weight)
+                nn.init.zeros_(self.net[-1].bias)
+            # _UNet3Skip handles its own zero-init internally.
 
         # If in_ch == 0, treat it as a learned constant bias per output channel
         else:
             self.net = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
 
+        # Build optional MLP tail.  Skipped for the constant-bias branch
+        # (in_ch == 0) since there is no spatial input to enrich.
+        self.tail = None
+        if mlp_tail_hidden > 0 and self.in_ch > 0:
+            self.tail = _build_mlp_tail(out_ch, mlp_tail_hidden)
+
     def forward(self, x, neg=False):
         if self.in_ch > 0:
             x = self.net(x)
+            if self.tail is not None:
+                # Residual MLP tail: zero-init last conv → tail(x) = 0 at step 0,
+                # so this is bit-identical to the no-tail forward until the tail
+                # weights move during training.  For the s-network, this residual
+                # acts in the pre-tanh logit space, so the multiplicative scale
+                # stays strictly positive and the inverse (neg=True) round-trip
+                # remains exact (s_full(x1) and s_full(x1, neg=True) traverse
+                # the same tail with opposite sign on the bounded factor).
+                x = x + self.tail(x)
         else:
             B, _, H, W = x.shape
             x = self.net.expand(B, self.out_ch, H, W)

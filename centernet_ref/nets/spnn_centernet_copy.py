@@ -22,7 +22,9 @@ if _project_root not in sys.path:
 
 from models import (SPNN, ConvPINNBlock, PixelUnshuffleBlock,
                     Cayley1x1Conv, Householder1x1Conv)
-from models_deeper import ConvMLP as _DeeperConvMLP
+# This is the *copy* wrapper file — point at the matching copy of
+# models_deeper so changes here can be tested in isolation from the original.
+from models_deeper_copy import ConvMLP as _DeeperConvMLP
 
 
 class _DeepHeadConvPINNBlock(ConvPINNBlock):
@@ -38,25 +40,27 @@ class _DeepHeadConvPINNBlock(ConvPINNBlock):
 
     def __init__(self, in_ch, out_ch, hidden=64, scale_bound=2.,
                  img_size=32, mix_type="householder", feat_size=None,
-                 mlp_tail_hidden=0):
+                 t_bias_init=None, s_log_scale_init=None):
         super().__init__(in_ch=in_ch, out_ch=out_ch, hidden=hidden,
                          scale_bound=scale_bound, img_size=img_size,
                          mix_type=mix_type, feat_size=feat_size)
-        # Replace shallow t/s/r with the deeper variant.  When
-        # mlp_tail_hidden > 0, each ConvMLP appends a per-pixel MLP residual
-        # after its U-net (zero-init last conv → identity at step 0), adding
-        # nonlinear channel-direction capacity inside s/t/r.  Bijectivity is
-        # unchanged: the coupling y = x0 * s(x1) + t(x1) is invertible for any
-        # deterministic s, t — the tail just makes them deeper.
+        # Replace shallow t/s/r with the deeper variant.
+        # When t_bias_init / s_log_scale_init are passed (only intended for
+        # the LAST head block — see build_spnn_centernet), each ConvMLP also
+        # constructs a learnable per-output-channel affine inside itself
+        # (self.t.final_bias and self.s.final_log_scale).  These get gradient,
+        # save into state_dict, and replace the role of the external
+        # hmap_scale / hmap_bias when --no_hmap_scale --no_hmap_bias is used.
+        # r is intentionally left without affine — it's only used by pinv()
+        # and doesn't see detection-logit dynamic range.
         self.t = _DeeperConvMLP(in_ch - out_ch, out_ch, None, hidden,
                                 img_size=img_size, feat_size=feat_size,
-                                mlp_tail_hidden=mlp_tail_hidden)
+                                final_bias_init=t_bias_init)
         self.s = _DeeperConvMLP(in_ch - out_ch, out_ch, scale_bound, hidden,
                                 img_size=img_size, feat_size=feat_size,
-                                mlp_tail_hidden=mlp_tail_hidden)
+                                final_log_scale_init=s_log_scale_init)
         self.r = _DeeperConvMLP(out_ch, in_ch - out_ch, None, hidden,
-                                img_size=img_size, feat_size=feat_size,
-                                mlp_tail_hidden=mlp_tail_hidden)
+                                img_size=img_size, feat_size=feat_size)
 
 
 def transfer_backbone_from_classifier(cls_checkpoint_path, spnn_model):
@@ -131,7 +135,8 @@ class SPNNCenterNet(nn.Module):
                  hmap_init_bias=-2.19,
                  head_mode='affine', head_mix_type='householder',
                  head_mix_reflections=None,
-                 freeze_backbone=False, num_backbone_blocks=4):
+                 freeze_backbone=False, num_backbone_blocks=4,
+                 no_hmap_scale=False, no_hmap_bias=False):
         super().__init__()
         self.spnn = spnn
         self.num_classes = num_classes
@@ -144,8 +149,16 @@ class SPNNCenterNet(nn.Module):
         # and the head, so gradients flow only into head blocks + adapter.
         self.freeze_backbone = freeze_backbone
         self.num_backbone_blocks = num_backbone_blocks
-        self.hmap_scale = nn.Parameter(torch.ones(1, num_classes, 1, 1) * hmap_init_scale)
-        self.hmap_bias = nn.Parameter(torch.full((1, num_classes, 1, 1), float(hmap_init_bias)))
+        # When no_hmap_scale / no_hmap_bias are set, the corresponding
+        # parameter is not constructed at all (not just initialized to 1/0)
+        # and the matching op is skipped in forward / hmap_to_raw — so the
+        # spnn's raw hmap channels become the detection logits directly.
+        self.use_hmap_scale = not no_hmap_scale
+        self.use_hmap_bias = not no_hmap_bias
+        if self.use_hmap_scale:
+            self.hmap_scale = nn.Parameter(torch.ones(1, num_classes, 1, 1) * hmap_init_scale)
+        if self.use_hmap_bias:
+            self.hmap_bias = nn.Parameter(torch.full((1, num_classes, 1, 1), float(hmap_init_bias)))
         if head_mode == 'orthogonal_mix':
             if head_mix_type == 'cayley':
                 self.hmap_mix = Cayley1x1Conv(num_classes)
@@ -181,10 +194,13 @@ class SPNNCenterNet(nn.Module):
         else:
             raw = self.spnn(x)  # [B, num_classes+4, H/4, W/4]
         hmap_raw = raw[:, :self.num_classes]
-        hmap = hmap_raw * self.hmap_scale  # per-channel rescale
+        hmap = hmap_raw
+        if self.use_hmap_scale:
+            hmap = hmap * self.hmap_scale  # per-channel rescale
         if self.head_mode == 'orthogonal_mix':
             hmap = self.hmap_mix(hmap)     # 20×20 orthogonal channel mix
-        hmap = hmap + self.hmap_bias       # per-channel offset
+        if self.use_hmap_bias:
+            hmap = hmap + self.hmap_bias   # per-channel offset
         regs = raw[:, self.num_classes:self.num_classes + 2]  # [B, 2, H/4, W/4]
         w_h_ = raw[:, self.num_classes + 2:]  # [B, 2, H/4, W/4]
         return [[hmap, regs, w_h_]]
@@ -194,10 +210,14 @@ class SPNNCenterNet(nn.Module):
 
         Used by the pinv / DDNM chain — apply this first, then SPNN.pinv.
         """
-        y = hmap - self.hmap_bias.to(hmap.device)
+        y = hmap
+        if self.use_hmap_bias:
+            y = y - self.hmap_bias.to(hmap.device)
         if self.head_mode == 'orthogonal_mix':
             y = self.hmap_mix.inverse(y)  # apply W^T
-        return y / self.hmap_scale.to(hmap.device)
+        if self.use_hmap_scale:
+            y = y / self.hmap_scale.to(hmap.device)
+        return y
 
     def pinv(self, hmap, regs, w_h_, latents=None):
         """Right-inverse of forward: y = [hmap, regs, w_h_]  →  reconstructed image.
@@ -221,9 +241,10 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
                          head_mix_type='householder',
                          head_mix_reflections=None,
                          deep_det_head=False, deep_head_hidden=128,
-                         mlp_tail_hidden=0,
                          two_block_head=False,
-                         freeze_backbone=False):
+                         freeze_backbone=False,
+                         no_hmap_scale=False, no_hmap_bias=False,
+                         internal_head_affine=False):
     """Build end-to-end invertible SPNN for CenterNet detection.
 
     Architecture (Option C: multi-scale 128+64):
@@ -246,15 +267,35 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
     """
     out_ch = num_classes + 4  # 20 + 4 = 24 for VOC
 
-    def _head_block(in_ch_b, out_ch_b):
+    # When internal_head_affine is set, the LAST head block carries learnable
+    # per-output-channel affine inside its s and t (s.final_log_scale,
+    # t.final_bias).  Init vectors mirror what the external hmap_scale /
+    # hmap_bias would have done: hmap channels (first num_classes) take
+    # log(hmap_init_scale) and hmap_init_bias respectively; regs/wh channels
+    # (last 4) get 0 (multiplicative=1, additive=0).  Earlier head blocks
+    # (with two_block_head) are NOT class-aligned at their output, so giving
+    # them a class-shaped bias would be meaningless — only the last block
+    # gets these inits.
+    if internal_head_affine:
+        import math
+        t_bias_init = ([float(hmap_init_bias)] * num_classes
+                       + [0.0] * 4)
+        s_log_scale_init = ([math.log(float(hmap_init_scale))] * num_classes
+                            + [0.0] * 4)
+    else:
+        t_bias_init = None
+        s_log_scale_init = None
+
+    def _head_block(in_ch_b, out_ch_b, is_last=False):
         """Build one detector-head ConvPINN block, deep variant if requested."""
         cls = _DeepHeadConvPINNBlock if deep_det_head else ConvPINNBlock
         kwargs = {"in_ch": in_ch_b, "out_ch": out_ch_b,
                   "hidden": deep_head_hidden if deep_det_head else hidden,
                   "scale_bound": scale_bound, "feat_size": 64,
                   "mix_type": mix_type}
-        if deep_det_head:
-            kwargs["mlp_tail_hidden"] = mlp_tail_hidden
+        if deep_det_head and is_last and internal_head_affine:
+            kwargs["t_bias_init"] = t_bias_init
+            kwargs["s_log_scale_init"] = s_log_scale_init
         return (cls, kwargs)
 
     layer_channels = [
@@ -273,10 +314,10 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
     # When deep_det_head=True, head blocks use the deeper U-net t/s/r nets
     # from models_deeper.py.
     if two_block_head:
-        layer_channels.append(_head_block(28, 26))
-        layer_channels.append(_head_block(26, out_ch))
+        layer_channels.append(_head_block(28, 26, is_last=False))
+        layer_channels.append(_head_block(26, out_ch, is_last=True))
     else:
-        layer_channels.append(_head_block(28, out_ch))
+        layer_channels.append(_head_block(28, out_ch, is_last=True))
 
     spnn = SPNN(
         img_ch=3,
@@ -299,7 +340,9 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
                          head_mix_type=head_mix_type,
                          head_mix_reflections=head_mix_reflections,
                          freeze_backbone=freeze_backbone,
-                         num_backbone_blocks=4)
+                         num_backbone_blocks=4,
+                         no_hmap_scale=no_hmap_scale,
+                         no_hmap_bias=no_hmap_bias)
 
 
 def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
@@ -308,9 +351,10 @@ def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
                        head_mix_type='householder',
                        head_mix_reflections=None,
                        deep_det_head=False, deep_head_hidden=128,
-                       mlp_tail_hidden=0,
                        two_block_head=False,
-                       freeze_backbone=False):
+                       freeze_backbone=False,
+                       no_hmap_scale=False, no_hmap_bias=False,
+                       internal_head_affine=False):
     """Entry point matching CenterNet's model creation pattern."""
     return build_spnn_centernet(num_classes=num_classes,
                                 pretrained_backbone=pretrained_backbone,
@@ -321,6 +365,8 @@ def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
                                 head_mix_reflections=head_mix_reflections,
                                 deep_det_head=deep_det_head,
                                 deep_head_hidden=deep_head_hidden,
-                                mlp_tail_hidden=mlp_tail_hidden,
                                 two_block_head=two_block_head,
-                                freeze_backbone=freeze_backbone)
+                                freeze_backbone=freeze_backbone,
+                                no_hmap_scale=no_hmap_scale,
+                                no_hmap_bias=no_hmap_bias,
+                                internal_head_affine=internal_head_affine)

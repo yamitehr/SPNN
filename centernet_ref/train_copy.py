@@ -21,7 +21,9 @@ import torch.distributed as dist
 from centernet_datasets.coco import COCO, COCO_eval
 from centernet_datasets.pascal import PascalVOC, PascalVOC_eval
 
-from nets.spnn_centernet import get_spnn_centernet
+# This is the *copy* training script — point at the matching copy of the
+# spnn_centernet wrapper so changes here can be tested in isolation.
+from nets.spnn_centernet_copy import get_spnn_centernet
 
 from utils.utils import _tranpose_and_gather_feature, load_model
 from utils.image import transform_preds
@@ -75,14 +77,6 @@ parser.add_argument('--deep_head_hidden', type=int, default=128,
                          'feat_size=64 the deeper U-net is h, 2h, 4h. '
                          '128 → ~30M extra params; 256 → ~120M extra. '
                          'Ignored when --deep_det_head is not set.')
-parser.add_argument('--mlp_tail_hidden', type=int, default=0,
-                    help='If > 0, append a per-pixel MLP residual tail '
-                         '(1x1 Conv → GN → GELU stack, zero-init last conv) '
-                         'inside each of s/t/r in the deep det head. Adds '
-                         'nonlinear channel-direction capacity without '
-                         'breaking bijectivity (the inverse picks up the '
-                         'same residual). 0 = current behavior (no tail). '
-                         'Requires --deep_det_head.')
 parser.add_argument('--two_block_head', action='store_true',
                     help='Split the detector head into 2 ConvPINN blocks '
                          '(28→26→24) instead of the default single block '
@@ -96,15 +90,31 @@ parser.add_argument('--freeze_backbone', action='store_true',
                          'between backbone and head during forward. Only the '
                          'head ConvPINN block(s) and the affine adapter / '
                          'orthogonal mixer receive gradients.')
-parser.add_argument('--warm_start_full', type=str, default=None,
-                    help='Path to a full SPNN-CenterNet checkpoint.t7 to '
-                         'warm-start the entire model from (loaded with '
-                         'strict=False so newly-introduced params like '
-                         's_tail / t_tail / r_tail keep their constructed '
-                         'init while every existing weight is overwritten). '
-                         'Use this to resume / fine-tune a deep-head run '
-                         'with --mlp_tail_hidden enabled.')
-
+parser.add_argument('--no_hmap_scale', action='store_true',
+                    help='Skip the per-class hmap_scale parameter entirely '
+                         '(no construction, no multiplication in forward). '
+                         'Forces the spnn raw hmap channels to act directly '
+                         'as detection logits at the right magnitude.')
+parser.add_argument('--no_hmap_bias', action='store_true',
+                    help='Skip the per-class hmap_bias parameter entirely '
+                         '(no construction, no addition in forward). '
+                         'Forces the spnn raw hmap channels to encode the '
+                         'detection-logit floor (~-2 for negatives) instead '
+                         'of relying on a learned shift.')
+parser.add_argument('--internal_head_affine', action='store_true',
+                    help='Add learnable per-output-channel affine INSIDE the '
+                         "head's s and t networks (the ConvMLPs). "
+                         'self.t.final_bias (additive, init from hmap_init_bias '
+                         'on hmap channels, 0 on regs/wh) and '
+                         'self.s.final_log_scale (multiplicative on the s '
+                         'output, init from log(hmap_init_scale) on hmap, '
+                         '0 on regs/wh). Both are nn.Parameter — learned '
+                         'via the optimizer like any other weight, saved in '
+                         'state_dict, and bijectivity-preserving (the s '
+                         'inverse uses sign-flipped log_scale via the neg '
+                         'flag). Intended use: combined with --no_hmap_scale '
+                         '--no_hmap_bias to relocate the affine from the '
+                         'external head into s/t.')
 parser.add_argument('--img_size', type=int, default=512)
 parser.add_argument('--split_ratio', type=float, default=1.0)
 
@@ -257,50 +267,35 @@ def main():
                                                      else None),
                                deep_det_head=cfg.deep_det_head,
                                deep_head_hidden=cfg.deep_head_hidden,
-                               mlp_tail_hidden=cfg.mlp_tail_hidden,
                                two_block_head=cfg.two_block_head,
-                               freeze_backbone=cfg.freeze_backbone)
+                               freeze_backbone=cfg.freeze_backbone,
+                               no_hmap_scale=cfg.no_hmap_scale,
+                               no_hmap_bias=cfg.no_hmap_bias,
+                               internal_head_affine=cfg.internal_head_affine)
   else:
     raise NotImplementedError
-
-  # Full-model warm start: load every weight that's compatible from a prior
-  # SPNN-CenterNet checkpoint (strict=False so newly-introduced params like
-  # the s_tail / t_tail / r_tail keys keep their constructed init).
-  # Done BEFORE DDP/DataParallel wrap so we work with the un-prefixed keys.
-  if cfg.arch == 'spnn' and cfg.warm_start_full is not None:
-    print('[warm-start-full] loading %s' % cfg.warm_start_full)
-    raw_w = torch.load(cfg.warm_start_full, map_location='cpu', weights_only=False)
-    if isinstance(raw_w, dict) and 'state_dict' in raw_w:
-      w_state = raw_w['state_dict']
-    elif isinstance(raw_w, dict) and 'model' in raw_w:
-      w_state = raw_w['model']
-    else:
-      w_state = raw_w
-    w_state = {k[7:] if k.startswith('module.') else k: v for k, v in w_state.items()}
-    missing, unexpected = model.load_state_dict(w_state, strict=False)
-    print('[warm-start-full] loaded: missing=%d, unexpected=%d' %
-          (len(missing), len(unexpected)))
-    if missing:
-      print('[warm-start-full] first missing keys (kept at constructed init): %s'
-            % missing[:8])
-    if unexpected:
-      print('[warm-start-full] unexpected keys (ignored): %s' % unexpected[:8])
 
   if cfg.dist:
     # model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model = model.to(cfg.device)
-    # find_unused_parameters=True is required because:
-    #  1) every coupling block has an `r` network used only by model.pinv()
-    #     (the inverse direction for DDNM); during detection training those
-    #     params never receive gradient.
-    #  2) when --mlp_tail_hidden > 0 the tail's last 1x1 conv is zero-init,
-    #     so at step 0 the tail's inner layers see d_loss/d_input = 0 and
-    #     also miss gradient until W_last starts moving.
-    # DataParallel tolerated both silently; DDP needs to be told explicitly.
+    # static_graph=True covers two simultaneous DDP edge cases:
+    #  1) Consistently unused parameters — every coupling block has an `r`
+    #     network used only by model.pinv() (the inverse direction for DDNM).
+    #     When --lambda_img_rec=0 those params never receive gradient during
+    #     supervised training. static_graph=True subsumes
+    #     find_unused_parameters=True for this case.
+    #  2) Reentrant backwards — when --lambda_img_rec > 0, model.pinv()
+    #     reuses the same s/t/mix/affine parameters that forward already
+    #     touched. The same param is reached by two distinct sub-graphs in
+    #     one backward pass; with find_unused_parameters=True alone this
+    #     raises "Parameter ... has been marked as ready twice".
+    #     static_graph=True is PyTorch's supported fix for reentrant backward.
+    # Requires the autograd graph shape to be constant across iterations,
+    # which holds here (loss components are fixed per-run by config flags).
     model = nn.parallel.DistributedDataParallel(model,
                                                 device_ids=[cfg.local_rank, ],
                                                 output_device=cfg.local_rank,
-                                                find_unused_parameters=True)
+                                                static_graph=True)
   else:
     model = nn.DataParallel(model).to(cfg.device)
 

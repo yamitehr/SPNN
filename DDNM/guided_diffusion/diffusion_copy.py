@@ -556,46 +556,11 @@ class Diffusion(object):
                         # None-Linear Back Projection
                         y_cur, z_cur = A(x0_t_hat, return_latents=True)
 
-                        # Stopping condition: task-dependent error metric
-                        if y_cur.dim() == 2:
-                            # Classification: sigmoid-based attribute error.
-                            # Bounded in [0, 1]; threshold ~0.1 is meaningful.
-                            nlbp_error = (y_cur.sigmoid() - y.sigmoid()).abs().mean()
-                        elif (getattr(args, "task", "classification") == "detection"
-                              and y_cur.dim() == 4
-                              and y_cur.shape[1] == args.detector_num_classes + 4):
-                            # Detection stop condition: peak-match.
-                            #   target peak = local-max cell in y[:, :nc].sigmoid()
-                            #     above det_target_peak_thresh — i.e. each "real"
-                            #     detection on the ORIGINAL image (e.g. dog 0.74,
-                            #     person 0.67).
-                            #   BP is skipped when y_cur.sigmoid() at every such
-                            #     (class, y, x) is already >= det_match_conf_thresh.
-                            #   nlbp_error is "how far below match_conf_thresh is
-                            #     the worst (least-matched) peak" — clamped to 0,
-                            #     so 0 means "all peaks already matched, stop BP".
-                            import torch.nn.functional as F
-                            nc = args.detector_num_classes
-                            target_prob = y[:, :nc].sigmoid()
-                            cur_prob = y_cur[:, :nc].sigmoid()
-                            keep = (F.max_pool2d(target_prob, kernel_size=3,
-                                                 stride=1, padding=1)
-                                    == target_prob).float()
-                            peak_mask = ((target_prob * keep)
-                                         > args.det_target_peak_thresh)
-                            if peak_mask.any():
-                                worst_match = cur_prob[peak_mask].min()
-                                nlbp_error = (args.det_match_conf_thresh
-                                              - worst_match).clamp(min=0)
-                            else:
-                                # No high-confidence target detections —
-                                # nothing to enforce; don't run BP.
-                                nlbp_error = torch.tensor(0.0, device=y.device)
-                        else:
-                            # Generic spatial output: raw tensor distance.
-                            nlbp_error = (y_cur - y).abs().mean()
+                        nlbp_error = (y_cur.sigmoid() - y.sigmoid()).abs().mean()
 
-                        if nlbp_error > args.nlbp_stop_cond:
+                        # lambda_t == 0 means "skip BP for this regime entirely":
+                        # x0_t_hat stays as x0_t (the assignment a few lines up).
+                        if lambda_t != 0.0 and nlbp_error > args.nlbp_stop_cond:
 
                             y_tar, z_tar = A(Ap(y), return_latents=True)
                             y_proj, z_proj = A(Ap(A(x0_t_hat)), return_latents=True)
@@ -609,7 +574,6 @@ class Diffusion(object):
                             y_final = y_cur + lambda_t * (y_tar - y_proj)
 
                             x0_t_hat = Ap(y_final, latents=z_final)
-                            x0_t_hat = x0_t_hat.clamp(-1, 1)
 
                         if step_idx % 10 == 0 or step_idx < 5:
                             print(f"  step {step_idx}: t={i} | x0_t range=[{x0_t.min():.3f}, {x0_t.max():.3f}] mean={x0_t.mean():.3f} | "

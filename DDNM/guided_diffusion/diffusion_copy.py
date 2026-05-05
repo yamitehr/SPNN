@@ -234,7 +234,7 @@ class Diffusion(object):
         for p in (_project_root, _centernet_ref):
             if p not in _sys.path:
                 _sys.path.insert(0, p)
-        from nets.spnn_centernet import get_spnn_centernet  # noqa: E402
+        from nets.spnn_centernet_copy import get_spnn_centernet  # noqa: E402
 
         assert args.detector_ckpt is not None, \
             "Must provide --detector_ckpt for detection DDNM"
@@ -253,6 +253,9 @@ class Diffusion(object):
             deep_head_hidden=args.detector_deep_head_hidden,
             two_block_head=args.detector_two_block_head,
             freeze_backbone=False,
+            no_hmap_scale=getattr(args, 'no_hmap_scale', False),
+            no_hmap_bias=getattr(args, 'no_hmap_bias', False),
+            internal_head_affine=getattr(args, 'internal_head_affine', False),
         ).to(self.device)
 
         raw = torch.load(args.detector_ckpt, map_location=self.device,
@@ -303,11 +306,21 @@ class Diffusion(object):
         def _wrapper_post_spnn(raw_24ch):
             """Manually replay the wrapper's post-SPNN ops on raw [B,24,H,W].
             Used only by A's return_latents path (where we need access to
-            SPNN's latents, which the wrapper's forward doesn't expose)."""
-            hmap = raw_24ch[:, :nc] * detector.hmap_scale
+            SPNN's latents, which the wrapper's forward doesn't expose).
+
+            Mirrors SPNNCenterNet.forward exactly: scale → mix → bias, with
+            scale/bias skipped when use_hmap_scale / use_hmap_bias are off.
+            When the head is configured with --no_hmap_scale --no_hmap_bias
+            --internal_head_affine, the affine effect lives entirely inside
+            spnn (in the last head block's s/t), so this function is just an
+            (optional) orthogonal mix."""
+            hmap = raw_24ch[:, :nc]
+            if getattr(detector, 'use_hmap_scale', True):
+                hmap = hmap * detector.hmap_scale
             if detector.head_mode == 'orthogonal_mix':
                 hmap = detector.hmap_mix(hmap)
-            hmap = hmap + detector.hmap_bias
+            if getattr(detector, 'use_hmap_bias', True):
+                hmap = hmap + detector.hmap_bias
             regs = raw_24ch[:, nc:nc + 2]
             w_h_ = raw_24ch[:, nc + 2:]
             return torch.cat([hmap, regs, w_h_], dim=1)
@@ -333,16 +346,109 @@ class Diffusion(object):
 
         return detector, A, Ap
 
+    # 0..19 → VOC class name. The pascal_test2007.json categories list is
+    # already alphabetical (id 1=aeroplane, ..., 20=tvmonitor), and SPNN's
+    # output channels follow the same 0..19 ordering — so this list aligns
+    # with the class index returned by ctdet_decode().
+    _VOC_NAMES = [
+        "aeroplane", "bicycle", "bird", "boat", "bottle", "bus", "car", "cat",
+        "chair", "cow", "diningtable", "dog", "horse", "motorbike", "person",
+        "pottedplant", "sheep", "sofa", "train", "tvmonitor",
+    ]
+
+    def _save_detection_grid(self, idx, results_dir, voc_dataset, classes,
+                             orig_chw_01, y_orig, *, nc=20,
+                             score_thresh=0.05, max_boxes=15, K=100):
+        """2-panel figure: orig+GT (red) | orig+SPNN-pred (cyan, class:score).
+
+        orig_chw_01: torch tensor [3, H, W], values in [0, 1] (CPU).
+        y_orig:      detector output [1, nc+4, H/4, W/4] (any device).
+        """
+        # Lazy imports — only when running the detection task.
+        import sys as _sys
+        _project_root = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "..", ".."))
+        _centernet_ref = os.path.join(_project_root, "centernet_ref")
+        for _p in (_project_root, _centernet_ref):
+            if _p not in _sys.path:
+                _sys.path.insert(0, _p)
+        from utils.post_process import ctdet_decode  # noqa: E402
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        stride = 4  # CenterNet stride at 256→64
+        H = orig_chw_01.shape[-1]
+
+        voc_id = classes[0].item() if classes.dim() > 0 else classes.item()
+        gt = voc_dataset.get_gt_in_image_coords(voc_id)
+
+        with torch.no_grad():
+            hmap = y_orig[:, :nc]
+            regs = y_orig[:, nc:nc + 2]
+            w_h_ = y_orig[:, nc + 2:nc + 4]
+            dets = ctdet_decode(hmap, regs, w_h_, K=K)[0].cpu().numpy()
+        # sort by score descending, drop low-confidence
+        dets = dets[np.argsort(-dets[:, 4])]
+
+        rgb = orig_chw_01.clamp(0, 1).permute(1, 2, 0).numpy()
+
+        fig, axes = plt.subplots(1, 2, figsize=(10, 5))
+
+        # --- Left: GT ---
+        axes[0].imshow(rgb)
+        axes[0].set_title(f"img {idx} (voc_id={voc_id})  GT  [{len(gt)} objs]",
+                          fontsize=9)
+        for name, (x1, y1, x2, y2) in gt:
+            axes[0].add_patch(plt.Rectangle(
+                (x1, y1), x2 - x1, y2 - y1,
+                fill=False, edgecolor="red", lw=1.5))
+            axes[0].text(x1 + 1, y1 + 8, name,
+                         color="white", fontsize=7,
+                         bbox=dict(facecolor="red", alpha=0.6, pad=0.5))
+        axes[0].set_xlim(0, H); axes[0].set_ylim(H, 0); axes[0].axis("off")
+
+        # --- Right: SPNN predictions ---
+        axes[1].imshow(rgb)
+        shown = 0
+        for d in dets:
+            x1, y1, x2, y2, sc, cls = d
+            if sc < score_thresh:
+                continue
+            x1p, y1p, x2p, y2p = (x1 * stride, y1 * stride,
+                                  x2 * stride, y2 * stride)
+            cls = int(cls)
+            cname = self._VOC_NAMES[cls] if 0 <= cls < len(self._VOC_NAMES) else str(cls)
+            axes[1].add_patch(plt.Rectangle(
+                (x1p, y1p), x2p - x1p, y2p - y1p,
+                fill=False, edgecolor="cyan", lw=1.5))
+            axes[1].text(x1p + 1, y1p + 8, f"{cname}:{sc:.2f}",
+                         color="white", fontsize=7,
+                         bbox=dict(facecolor="darkblue", alpha=0.65, pad=0.5))
+            shown += 1
+            if shown >= max_boxes:
+                break
+        axes[1].set_title(
+            f"SPNN top-K (score≥{score_thresh}, n={shown})", fontsize=9)
+        axes[1].set_xlim(0, H); axes[1].set_ylim(H, 0); axes[1].axis("off")
+
+        fig.tight_layout()
+        out_path = os.path.join(results_dir, f"grid_dets_{idx}.png")
+        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+
     def simplified_ddnm_plus(self, model):
         args, config = self.args, self.config
 
         # ---- dataset selection ---------------------------------------------
         # For the detection task we use VOC2007 test split. The default
         # get_dataset(...) doesn't know about VOC; bypass it.
+        voc_dataset = None  # unwrapped handle, used for GT-on-grid overlay
         if getattr(args, "task", "classification") == "detection":
             from datasets.voc import VOCValForDDNM
             test_dataset = VOCValForDDNM(args.voc_data_dir,
                                          image_size=config.data.image_size)
+            voc_dataset = test_dataset
         else:
             _, test_dataset = get_dataset(args, config)
 
@@ -458,17 +564,33 @@ class Diffusion(object):
                         elif (getattr(args, "task", "classification") == "detection"
                               and y_cur.dim() == 4
                               and y_cur.shape[1] == args.detector_num_classes + 4):
-                            # Detection: match the supervised training loss space.
-                            #   hmap channels in probability space (focal-loss-like)
-                            #   regs / w_h_ in raw L1, weighted as in training (1.0 / 0.1)
+                            # Detection stop condition: peak-match.
+                            #   target peak = local-max cell in y[:, :nc].sigmoid()
+                            #     above det_target_peak_thresh — i.e. each "real"
+                            #     detection on the ORIGINAL image (e.g. dog 0.74,
+                            #     person 0.67).
+                            #   BP is skipped when y_cur.sigmoid() at every such
+                            #     (class, y, x) is already >= det_match_conf_thresh.
+                            #   nlbp_error is "how far below match_conf_thresh is
+                            #     the worst (least-matched) peak" — clamped to 0,
+                            #     so 0 means "all peaks already matched, stop BP".
+                            import torch.nn.functional as F
                             nc = args.detector_num_classes
-                            e_hmap = (y_cur[:, :nc].sigmoid()
-                                      - y[:, :nc].sigmoid()).abs().mean()
-                            e_regs = (y_cur[:, nc:nc + 2]
-                                      - y[:, nc:nc + 2]).abs().mean()
-                            e_wh = (y_cur[:, nc + 2:nc + 4]
-                                    - y[:, nc + 2:nc + 4]).abs().mean()
-                            nlbp_error = e_hmap + 1.0 * e_regs + 0.1 * e_wh
+                            target_prob = y[:, :nc].sigmoid()
+                            cur_prob = y_cur[:, :nc].sigmoid()
+                            keep = (F.max_pool2d(target_prob, kernel_size=3,
+                                                 stride=1, padding=1)
+                                    == target_prob).float()
+                            peak_mask = ((target_prob * keep)
+                                         > args.det_target_peak_thresh)
+                            if peak_mask.any():
+                                worst_match = cur_prob[peak_mask].min()
+                                nlbp_error = (args.det_match_conf_thresh
+                                              - worst_match).clamp(min=0)
+                            else:
+                                # No high-confidence target detections —
+                                # nothing to enforce; don't run BP.
+                                nlbp_error = torch.tensor(0.0, device=y.device)
                         else:
                             # Generic spatial output: raw tensor distance.
                             nlbp_error = (y_cur - y).abs().mean()
@@ -494,6 +616,23 @@ class Diffusion(object):
                                   f"x0_t_hat range=[{x0_t_hat.min():.3f}, {x0_t_hat.max():.3f}] mean={x0_t_hat.mean():.3f} | "
                                   f"nlbp_error={nlbp_error:.4f} lambda_t={lambda_t:.2f}")
 
+                        # Per-step debug dump of x0_t and x0_t_hat for this
+                        # image. inverse_data_transform maps [-1,1] → [0,1]
+                        # for tvu.save_image. Lives in a `debug_x0` subdir
+                        # of image_folder, with one subdir per image.
+                        debug_dir = os.path.join(
+                            self.args.image_folder, "debug_x0",
+                            f"img_{idx_so_far}")
+                        os.makedirs(debug_dir, exist_ok=True)
+                        tvu.save_image(
+                            inverse_data_transform(config, x0_t[0].cpu()),
+                            os.path.join(debug_dir,
+                                         f"step{step_idx:03d}_x0_t.png"))
+                        tvu.save_image(
+                            inverse_data_transform(config, x0_t_hat[0].cpu()),
+                            os.path.join(debug_dir,
+                                         f"step{step_idx:03d}_x0_t_hat.png"))
+
                         c2 = (1 - at_next - sigma_t ** 2).clamp(min=0).sqrt()
                         xt_next = at_next.sqrt() * x0_t_hat + c2 * et + sigma_t * torch.randn_like(x0_t)
 
@@ -517,7 +656,25 @@ class Diffusion(object):
             # Save result grid
             results_dir = self.args.image_folder
             os.makedirs(results_dir, exist_ok=True)
-            res_grid = torch.cat([orig.cpu(), final_x0[0].cpu()], dim=-1)
+            # For the detection task, draw VOC GT boxes + class names on the
+            # original (left) half so the grid shows what the detector was
+            # supposed to be conditioned on, not just an empty street scene.
+            if voc_dataset is not None:
+                from PIL import Image, ImageDraw  # lazy import
+                voc_id = classes[0].item() if classes.dim() > 0 else classes.item()
+                gt = voc_dataset.get_gt_in_image_coords(voc_id)
+                arr = (orig.cpu().clamp(0, 1)
+                       .permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                pil = Image.fromarray(arr)
+                draw = ImageDraw.Draw(pil)
+                for name, (x1, y1, x2, y2) in gt:
+                    draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=2)
+                    draw.text((x1 + 2, y1 + 2), name, fill=(255, 255, 0))
+                orig_for_grid = (torch.from_numpy(np.array(pil))
+                                 .permute(2, 0, 1).float() / 255.0)
+            else:
+                orig_for_grid = orig.cpu()
+            res_grid = torch.cat([orig_for_grid, final_x0[0].cpu()], dim=-1)
             grid_path = os.path.join(results_dir, f"grid_{idx_so_far}.png")
             tvu.save_image(res_grid, grid_path)
 
@@ -525,6 +682,19 @@ class Diffusion(object):
             with torch.no_grad():
                 y_orig = A(x_orig)
                 y_gen = A(data_transform(config, final_x0.to(self.device)))
+
+                # Detection task: also save grid_dets_<i>.png — a 2-panel
+                # matplotlib figure with (left) original + GT boxes (red),
+                # (right) original + SPNN top-K predictions (cyan, with
+                # class:score). Same image both panels; lets you visually
+                # compare GT to what the detector actually outputs.
+                if voc_dataset is not None:
+                    self._save_detection_grid(
+                        idx_so_far, results_dir, voc_dataset, classes,
+                        orig.cpu(), y_orig,
+                        nc=args.detector_num_classes,
+                        score_thresh=0.2, max_boxes=15,
+                    )
                 if getattr(args, "task", "classification") == "detection":
                     # Per-component error in the same space as the NLBP stopping
                     # condition above, so the numbers are comparable across runs.

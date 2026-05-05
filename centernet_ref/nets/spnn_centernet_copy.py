@@ -188,11 +188,19 @@ class SPNNCenterNet(nn.Module):
             h, _ = block(h, return_latent=False)
         return h  # output_spatial_size is set, so SPNN skips the .view step
 
-    def forward(self, x):
+    def forward(self, x, return_latents=False):
         if self.freeze_backbone:
+            if return_latents:
+                raise NotImplementedError(
+                    "return_latents not supported with freeze_backbone")
             raw = self._spnn_forward_with_freeze(x)
+            z_list = None
         else:
-            raw = self.spnn(x)  # [B, num_classes+4, H/4, W/4]
+            if return_latents:
+                raw, z_list = self.spnn(x, return_latents=True)
+            else:
+                raw = self.spnn(x)  # [B, num_classes+4, H/4, W/4]
+                z_list = None
         hmap_raw = raw[:, :self.num_classes]
         hmap = hmap_raw
         if self.use_hmap_scale:
@@ -203,6 +211,8 @@ class SPNNCenterNet(nn.Module):
             hmap = hmap + self.hmap_bias   # per-channel offset
         regs = raw[:, self.num_classes:self.num_classes + 2]  # [B, 2, H/4, W/4]
         w_h_ = raw[:, self.num_classes + 2:]  # [B, 2, H/4, W/4]
+        if return_latents:
+            return [[hmap, regs, w_h_]], z_list
         return [[hmap, regs, w_h_]]
 
     def hmap_to_raw(self, hmap):

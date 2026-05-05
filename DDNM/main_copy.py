@@ -55,29 +55,17 @@ def parse_args_and_config():
         '--subset_end', type=int, default=-1
     )
     parser.add_argument(
-        "--min_bp_step", type=int, default=600, help="Minimum step to start back-projection"
+        "--min_bp_step", type=int, default=300, help="Minimum step to start back-projection"
     )
     parser.add_argument(
-        "--lambda1", type=float, default=0.5, help="Lambda for BP when step < min_bp_step"
+        "--lambda1", type=float, default=0.0, help="Lambda for BP when step < min_bp_step"
     )
     parser.add_argument(
-        "--lambda2", type=float, default=0.5, help="Lambda for BP when step >= min_bp_step"
+        "--lambda2", type=float, default=1.0, help="Lambda for BP when step >= min_bp_step"
     )
     parser.add_argument(
-        "--nlbp_stop_cond", type=float, default=0.11, help="Skip back-projection when attribute error is below this threshold"
+        "--nlbp_stop_cond", type=float, default=-1, help="Skip back-projection when attribute error is below this threshold"
     )
-    # Detection-task stop condition (peak-match). When the original image's
-    # detector produces a peak with sigmoid >= det_target_peak_thresh, that
-    # location must already have sigmoid >= det_match_conf_thresh in the
-    # current iterate — otherwise BP runs to push it up.
-    parser.add_argument("--det_target_peak_thresh", type=float, default=0.5,
-                        help="Probability threshold for what counts as a 'real' "
-                             "detection on the original image. Only peaks above "
-                             "this in y are required to be matched.")
-    parser.add_argument("--det_match_conf_thresh", type=float, default=0.2,
-                        help="Required probability at each target-peak position "
-                             "in the current iterate. BP is skipped once every "
-                             "target peak is matched at this confidence.")
     # SPNN args for ImageNet/ImageNette (classification task)
     parser.add_argument("--spnn_ckpt", type=str, default=None, help="Path to SPNN classifier checkpoint")
     parser.add_argument("--spnn_num_classes", type=int, default=10, help="Number of SPNN classes (10 for ImageNette, 1000 for ImageNet)")

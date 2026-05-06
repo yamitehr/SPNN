@@ -613,41 +613,23 @@ class Diffusion(object):
 
                             x0_t_hat = Ap(y_final, latents=z_final)
 
-                        # bb-edit: localized smooth-paste. The 2×-expanded
-                        # bbox defines the spatial extent where any change
-                        # to x0_t happens (outside it is untouched). Within
-                        # that crop, smooth_paste blends x0_t_hat into x0_t
-                        # with weight=1 in the inner GT bbox and Gaussian
-                        # falloff (smoothness=0.2 → fully decayed by the
-                        # 2× edge). xt_next below is formed from this
-                        # locally-blended x0_t.
+                        # bb-edit: smooth-paste over the full image. weight=1
+                        # in the GT bbox, Gaussian falloff outside (σ =
+                        # smoothness × box_size). No hard cutoff — far
+                        # from the box the weight decays toward zero so
+                        # x0_t there stays effectively untouched. xt_next
+                        # below is formed from this blended x0_t.
                         if target_box is not None:
                             x0_t_hat = x0_t_hat + 0.025 * torch.randn_like(x0_t_hat)
                             bx1, by1, bx2, by2 = target_box
-                            S = config.data.image_size
-                            cx = (bx1 + bx2) / 2.0
-                            cy = (by1 + by2) / 2.0
-                            bw = bx2 - bx1
-                            bh = by2 - by1
-                            # 2× crop bounds (the modification region).
-                            ex1 = max(0, int(cx - bw))
-                            ey1 = max(0, int(cy - bh))
-                            ex2 = min(S, int(np.ceil(cx + bw)))
-                            ey2 = min(S, int(np.ceil(cy + bh)))
-                            # Inner bbox in crop-local coords.
-                            inner_top = max(0, int(by1) - ey1)
-                            inner_left = max(0, int(bx1) - ex1)
-                            inner_h = max(1, int(np.ceil(by2)) - int(by1))
-                            inner_w = max(1, int(np.ceil(bx2)) - int(bx1))
-                            if ex2 > ex1 and ey2 > ey1:
-                                crop_hat = x0_t_hat[..., ey1:ey2, ex1:ex2]
-                                crop_t = x0_t[..., ey1:ey2, ex1:ex2]
-                                x0_t = x0_t.clone()
-                                x0_t[..., ey1:ey2, ex1:ex2] = smooth_paste(
-                                    crop_hat, crop_t,
-                                    topleft=(inner_top, inner_left),
-                                    h=inner_h, w=inner_w,
-                                    smoothness=0.2)
+                            top = int(by1)
+                            left = int(bx1)
+                            h = max(1, int(np.ceil(by2)) - top)
+                            w = max(1, int(np.ceil(bx2)) - left)
+                            x0_t = smooth_paste(
+                                x0_t_hat, x0_t,
+                                topleft=(top, left), h=h, w=w,
+                                smoothness=1.0)
 
 
                         if step_idx % 10 == 0 or step_idx < 5:
@@ -698,20 +680,24 @@ class Diffusion(object):
             # Save result grid
             results_dir = self.args.image_folder
             os.makedirs(results_dir, exist_ok=True)
-            # For the detection task, draw VOC GT boxes + class names on the
-            # original (left) half so the grid shows what the detector was
-            # supposed to be conditioned on, not just an empty street scene.
+            # For the detection task, draw ONLY the GT box of the object we
+            # actually pasted (the first GT — see target_box/target_cls
+            # selected at the top of this image's loop body). Other GT
+            # boxes are intentionally not drawn so the left/right grid is
+            # a fair "what we conditioned on" vs "what came out".
             if voc_dataset is not None:
                 from PIL import Image, ImageDraw  # lazy import
-                voc_id = classes[0].item() if classes.dim() > 0 else classes.item()
-                gt = voc_dataset.get_gt_in_image_coords(voc_id)
                 arr = (orig.cpu().clamp(0, 1)
                        .permute(1, 2, 0).numpy() * 255).astype(np.uint8)
                 pil = Image.fromarray(arr)
                 draw = ImageDraw.Draw(pil)
-                for name, (x1, y1, x2, y2) in gt:
-                    draw.rectangle([x1, y1, x2, y2], outline=(255, 0, 0), width=2)
-                    draw.text((x1 + 2, y1 + 2), name, fill=(255, 255, 0))
+                if target_box is not None:
+                    x1, y1, x2, y2 = target_box
+                    draw.rectangle([x1, y1, x2, y2],
+                                   outline=(255, 0, 0), width=2)
+                    if target_cls is not None:
+                        draw.text((x1 + 2, y1 + 2), target_cls,
+                                  fill=(255, 255, 0))
                 orig_for_grid = (torch.from_numpy(np.array(pil))
                                  .permute(2, 0, 1).float() / 255.0)
             else:

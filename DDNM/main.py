@@ -58,7 +58,7 @@ def parse_args_and_config():
         "--min_bp_step", type=int, default=600, help="Minimum step to start back-projection"
     )
     parser.add_argument(
-        "--lambda1", type=float, default=0.5, help="Lambda for BP when step < min_bp_step"
+        "--lambda1", type=float, default=0.0, help="Lambda for BP when step < min_bp_step"
     )
     parser.add_argument(
         "--lambda2", type=float, default=0.5, help="Lambda for BP when step >= min_bp_step"
@@ -66,11 +66,39 @@ def parse_args_and_config():
     parser.add_argument(
         "--nlbp_stop_cond", type=float, default=0.11, help="Skip back-projection when attribute error is below this threshold"
     )
-    # SPNN args for ImageNet/ImageNette
+    # SPNN args for ImageNet/ImageNette (classification task)
     parser.add_argument("--spnn_ckpt", type=str, default=None, help="Path to SPNN classifier checkpoint")
     parser.add_argument("--spnn_num_classes", type=int, default=10, help="Number of SPNN classes (10 for ImageNette, 1000 for ImageNet)")
     parser.add_argument("--spnn_mix_type", type=str, default="householder", choices=["cayley", "householder"])
     parser.add_argument("--spnn_scale_bound", type=float, default=1.0)
+
+    # Detection task: SPNN CenterNet detector as the degradation
+    parser.add_argument("--task", choices=["classification", "detection"],
+                        default="classification",
+                        help="Degradation type. 'classification' uses an SPNN classifier "
+                             "and reads from --spnn_ckpt. 'detection' uses an SPNN CenterNet "
+                             "object detector and reads from --detector_ckpt.")
+    parser.add_argument("--detector_ckpt", type=str, default=None,
+                        help="Path to SPNN CenterNet checkpoint (e.g. ckpt/.../checkpoint.t7).")
+    parser.add_argument("--voc_data_dir", type=str, default="./data",
+                        help="Root containing voc/ subtree (images/, annotations/).")
+    parser.add_argument("--detector_num_classes", type=int, default=20)
+    # Detector architecture flags — must match the trained checkpoint.
+    parser.add_argument("--detector_deep_det_head", action="store_true")
+    parser.add_argument("--detector_deep_head_hidden", type=int, default=128)
+    parser.add_argument("--detector_two_block_head", action="store_true")
+    parser.add_argument("--detector_head_mode", type=str, default="affine",
+                        choices=["affine", "orthogonal_mix"])
+    parser.add_argument("--detector_head_mix_type", type=str, default="householder",
+                        choices=["cayley", "householder"])
+    parser.add_argument("--detector_head_mix_reflections", type=int, default=0)
+    parser.add_argument("--detector_hmap_init_scale", type=float, default=0.01)
+    parser.add_argument("--detector_hmap_init_bias", type=float, default=-2.19)
+    parser.add_argument("--detector_scale_bound", type=float, default=1.0)
+    parser.add_argument("--detector_mix_type", type=str, default="householder",
+                        choices=["cayley", "householder"])
+    parser.add_argument("--detector_hidden", type=int, default=256,
+                        help="Hidden width for backbone ConvPINN blocks.")
 
     args = parser.parse_args()
 

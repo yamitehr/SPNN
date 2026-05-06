@@ -141,9 +141,210 @@ class Diffusion(object):
         self.simplified_ddnm_plus(model)
 
 
+    # ===================================================================
+    # A / A† builders for the three supported tasks
+    # ===================================================================
+
+    def _build_imagenet_classification_A_Ap(self, args):
+        """Original SPNN-classifier path: A: image → class logits."""
+        spnn_ckpt = getattr(args, 'spnn_ckpt', None)
+        num_classes = getattr(args, 'spnn_num_classes', 10)
+        mix_type = getattr(args, 'spnn_mix_type', 'householder')
+        scale_bound = getattr(args, 'spnn_scale_bound', 1.0)
+        hidden = 256
+
+        layer_channels = [
+            (PixelUnshuffleBlock, {"r": 4}),
+            (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
+                             "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+            (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
+                             "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+            (PixelUnshuffleBlock, {"r": 4}),
+            (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
+                             "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+            (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
+                             "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+            (PixelUnshuffleBlock, {"r": 4}),
+            (ConvPINNBlock, {"in_ch": 768, "out_ch": 192, "hidden": hidden,
+                             "scale_bound": scale_bound, "feat_size": 4, "mix_type": mix_type}),
+            (PixelUnshuffleBlock, {"r": 4}),
+            (ConvPINNBlock, {"in_ch": 3072, "out_ch": 1024, "hidden": hidden,
+                             "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
+            (ConvPINNBlock, {"in_ch": 1024, "out_ch": num_classes, "hidden": hidden,
+                             "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
+        ]
+        classifier = SPNN(img_ch=3, num_classes=num_classes, img_size=256,
+                          layer_channels=layer_channels).to(self.device)
+
+        assert spnn_ckpt is not None, "Must provide --spnn_ckpt for ImageNet DDNM"
+        raw = torch.load(spnn_ckpt, map_location=self.device, weights_only=False)
+        state_dict = raw.get("state_dict", raw) if isinstance(raw, dict) and "state_dict" in raw else raw
+        classifier.load_state_dict(state_dict)
+        print(f"Loaded SPNN classifier ({num_classes} classes, {mix_type}) from {spnn_ckpt}")
+
+        img_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        img_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+
+        def diffusion_to_spnn(x):
+            x01 = (x + 1.0) / 2.0
+            return (x01 - img_mean) / img_std
+
+        def spnn_to_diffusion(x):
+            x01 = x * img_std + img_mean
+            return x01 * 2.0 - 1.0
+
+        A = lambda z, **kw: classifier(diffusion_to_spnn(z), **kw)
+        Ap = lambda logits, **kw: spnn_to_diffusion(classifier.pinv(logits, **kw))
+        return classifier, A, Ap
+
+    def _build_celeba_classification_A_Ap(self):
+        """CelebA SPNN classifier path."""
+        classifier = SPNN(img_ch=3, num_classes=40, hidden=128,
+                          scale_bound=2.0, img_size=256).to(self.device)
+        ckpt_path = hf_hub_download(repo_id="yamitehr/SPNN",
+                                    filename="spnn_celebahq_256.pth")
+        print(f"Loading classifier from {ckpt_path}")
+        classifier.load_state_dict(torch.load(ckpt_path, map_location=self.device,
+                                              weights_only=False))
+        A = lambda z, **kw: classifier(z, **kw)
+        Ap = lambda logits, **kw: classifier.pinv(logits, **kw)
+        return classifier, A, Ap
+
+    def _build_detection_A_Ap(self, args):
+        """SPNN-CenterNet path: A: image → full detector output (post-everything),
+        a single tensor [B, num_classes+4, 64, 64].
+
+        Bijective chain through ALL layers:
+          diffusion (RGB, [-1,1])
+            -> diffusion_to_detector: BGR + ImageNet-normalized
+            -> detector.spnn  -> raw [B, 24, 64, 64]
+            -> hmap channels: * scale, then orthogonal mix (if used), then + bias
+            -> regs / w_h_ pass through unchanged
+            -> y = cat([hmap, regs, w_h_], dim=1)
+
+        A† reverses every step. The wrapper's affine + (optional) orthogonal
+        mixer are both bijective, so they don't introduce extra latents — the
+        latent list comes entirely from `detector.spnn`.
+        """
+        # Lazy import so the classification path doesn't pay the import cost
+        # if centernet_ref isn't on sys.path.
+        import sys as _sys
+        _project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        _centernet_ref = os.path.join(_project_root, "centernet_ref")
+        for p in (_project_root, _centernet_ref):
+            if p not in _sys.path:
+                _sys.path.insert(0, p)
+        from nets.spnn_centernet import get_spnn_centernet  # noqa: E402
+
+        assert args.detector_ckpt is not None, \
+            "Must provide --detector_ckpt for detection DDNM"
+
+        head_mix_reflections = (args.detector_head_mix_reflections
+                                if args.detector_head_mix_reflections > 0 else None)
+        detector = get_spnn_centernet(
+            num_classes=args.detector_num_classes,
+            pretrained_backbone=None,  # we're loading the full ckpt below
+            hmap_init_scale=args.detector_hmap_init_scale,
+            hmap_init_bias=args.detector_hmap_init_bias,
+            head_mode=args.detector_head_mode,
+            head_mix_type=args.detector_head_mix_type,
+            head_mix_reflections=head_mix_reflections,
+            deep_det_head=args.detector_deep_det_head,
+            deep_head_hidden=args.detector_deep_head_hidden,
+            two_block_head=args.detector_two_block_head,
+            freeze_backbone=False,
+        ).to(self.device)
+
+        raw = torch.load(args.detector_ckpt, map_location=self.device,
+                         weights_only=False)
+        if isinstance(raw, dict) and 'state_dict' in raw:
+            state = raw['state_dict']
+        elif isinstance(raw, dict) and 'model' in raw:
+            state = raw['model']
+        else:
+            state = raw
+        # Strip 'module.' prefix from DataParallel / DDP saves
+        state = {k[7:] if k.startswith('module.') else k: v
+                 for k, v in state.items()}
+        missing, unexpected = detector.load_state_dict(state, strict=False)
+        print(f"[detector] Loaded {args.detector_ckpt} "
+              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        if missing:
+            print(f"[detector] first missing keys: {missing[:6]}")
+        if unexpected:
+            print(f"[detector] first unexpected keys: {unexpected[:6]}")
+        detector.eval()
+        for p in detector.parameters():
+            p.requires_grad_(False)
+
+        nc = args.detector_num_classes  # 20 for VOC
+        img_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
+        img_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
+
+        def diffusion_to_detector(x):
+            """[-1,1] RGB  →  BGR + ImageNet-normalized.
+
+            VOC pascal.py loaded images via cv2.imread (BGR) and never swapped
+            to RGB before applying RGB-named ImageNet stats — that's the
+            CenterNet convention. To match the detector's training distribution
+            we replicate it: RGB→BGR swap, then (x/255 − μ)/σ-equivalent step.
+            (We start in [0,1] post-denorm, so it's just (x − μ)/σ.)
+            """
+            x01 = (x + 1.0) / 2.0                # [-1,1] RGB → [0,1] RGB
+            x_bgr = x01[:, [2, 1, 0]]            # RGB → BGR
+            return (x_bgr - img_mean) / img_std
+
+        def detector_to_diffusion(x):
+            """BGR + ImageNet-normalized  →  [-1,1] RGB."""
+            x01_bgr = x * img_std + img_mean     # → [0,1] BGR
+            x01_rgb = x01_bgr[:, [2, 1, 0]]      # BGR → RGB
+            return x01_rgb * 2.0 - 1.0           # → [-1,1] RGB
+
+        def _wrapper_post_spnn(raw_24ch):
+            """Manually replay the wrapper's post-SPNN ops on raw [B,24,H,W].
+            Used only by A's return_latents path (where we need access to
+            SPNN's latents, which the wrapper's forward doesn't expose)."""
+            hmap = raw_24ch[:, :nc] * detector.hmap_scale
+            if detector.head_mode == 'orthogonal_mix':
+                hmap = detector.hmap_mix(hmap)
+            hmap = hmap + detector.hmap_bias
+            regs = raw_24ch[:, nc:nc + 2]
+            w_h_ = raw_24ch[:, nc + 2:]
+            return torch.cat([hmap, regs, w_h_], dim=1)
+
+        def A(z, return_latents=False):
+            x_det = diffusion_to_detector(z)
+            if return_latents:
+                raw, latents = detector.spnn(x_det, return_latents=True)
+                y = _wrapper_post_spnn(raw)
+                return y, latents
+            out = detector(x_det)                # SPNNCenterNet.forward
+            hmap, regs, w_h_ = out[0]
+            return torch.cat([hmap, regs, w_h_], dim=1)
+
+        def Ap(y, latents=None):
+            hmap = y[:, :nc]
+            regs = y[:, nc:nc + 2]
+            w_h_ = y[:, nc + 2:]
+            hmap_raw = detector.hmap_to_raw(hmap)        # invert affine + mix
+            raw = torch.cat([hmap_raw, regs, w_h_], dim=1)
+            x_det = detector.spnn.pinv(raw, latents=latents)
+            return detector_to_diffusion(x_det)
+
+        return detector, A, Ap
+
     def simplified_ddnm_plus(self, model):
         args, config = self.args, self.config
-        _, test_dataset = get_dataset(args, config)
+
+        # ---- dataset selection ---------------------------------------------
+        # For the detection task we use VOC2007 test split. The default
+        # get_dataset(...) doesn't know about VOC; bypass it.
+        if getattr(args, "task", "classification") == "detection":
+            from datasets.voc import VOCValForDDNM
+            test_dataset = VOCValForDDNM(args.voc_data_dir,
+                                         image_size=config.data.image_size)
+        else:
+            _, test_dataset = get_dataset(args, config)
 
         if args.subset_start >= 0 and args.subset_end > 0:
             assert args.subset_end > args.subset_start
@@ -170,73 +371,15 @@ class Diffusion(object):
             generator=g,
         )
 
-        # Load SPNN classifier
-        if config.data.dataset == 'ImageNet':
-            spnn_ckpt = getattr(args, 'spnn_ckpt', None)
-            num_classes = getattr(args, 'spnn_num_classes', 10)
-            mix_type = getattr(args, 'spnn_mix_type', 'householder')
-            scale_bound = getattr(args, 'spnn_scale_bound', 1.0)
-            hidden = 256
-
-            layer_channels = [
-                (PixelUnshuffleBlock, {"r": 4}),
-                (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
-                                 "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
-                (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
-                                 "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
-                (PixelUnshuffleBlock, {"r": 4}),
-                (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
-                                 "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
-                (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
-                                 "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
-                (PixelUnshuffleBlock, {"r": 4}),
-                (ConvPINNBlock, {"in_ch": 768, "out_ch": 192, "hidden": hidden,
-                                 "scale_bound": scale_bound, "feat_size": 4, "mix_type": mix_type}),
-                (PixelUnshuffleBlock, {"r": 4}),
-                (ConvPINNBlock, {"in_ch": 3072, "out_ch": 1024, "hidden": hidden,
-                                 "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
-                (ConvPINNBlock, {"in_ch": 1024, "out_ch": num_classes, "hidden": hidden,
-                                 "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
-            ]
-            classifier = SPNN(img_ch=3, num_classes=num_classes, img_size=256,
-                              layer_channels=layer_channels).to(self.device)
-
-            assert spnn_ckpt is not None, "Must provide --spnn_ckpt for ImageNet DDNM"
-            raw = torch.load(spnn_ckpt, map_location=self.device, weights_only=False)
-            state_dict = raw.get("state_dict", raw) if isinstance(raw, dict) and "state_dict" in raw else raw
-            classifier.load_state_dict(state_dict)
-            print(f"Loaded SPNN classifier ({num_classes} classes, {mix_type}) from {spnn_ckpt}")
+        # ---- A / A† selection ---------------------------------------------
+        if getattr(args, "task", "classification") == "detection":
+            classifier, A, Ap = self._build_detection_A_Ap(args)
+        elif config.data.dataset == 'ImageNet':
+            classifier, A, Ap = self._build_imagenet_classification_A_Ap(args)
         else:
-            # CelebA
-            classifier = SPNN(img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=256).to(
-                self.device)
-            ckpt_path = hf_hub_download(repo_id="yamitehr/SPNN", filename="spnn_celebahq_256.pth")
-            print(f"Loading classifier from {ckpt_path}")
-            classifier.load_state_dict(torch.load(ckpt_path, map_location=self.device, weights_only=False))
+            classifier, A, Ap = self._build_celeba_classification_A_Ap()
 
         classifier.eval()
-
-        # Domain conversion: diffusion operates in [-1, 1], SPNN trained with ImageNet normalization
-        if config.data.dataset == 'ImageNet':
-            img_mean = torch.tensor([0.485, 0.456, 0.406], device=self.device).view(1, 3, 1, 1)
-            img_std = torch.tensor([0.229, 0.224, 0.225], device=self.device).view(1, 3, 1, 1)
-
-            def diffusion_to_spnn(x):
-                """Convert [-1,1] diffusion domain to ImageNet-normalized domain."""
-                x01 = (x + 1.0) / 2.0  # [-1,1] -> [0,1]
-                return (x01 - img_mean) / img_std
-
-            def spnn_to_diffusion(x):
-                """Convert ImageNet-normalized domain back to [-1,1] diffusion domain."""
-                x01 = x * img_std + img_mean  # denormalize to [0,1]
-                return x01 * 2.0 - 1.0  # [0,1] -> [-1,1]
-
-            A = lambda z, **kwargs: classifier(diffusion_to_spnn(z), **kwargs)
-            Ap = lambda logits, **kwargs: spnn_to_diffusion(classifier.pinv(logits, **kwargs))
-        else:
-            # CelebA: both diffusion and SPNN use [-1,1] (rescaled)
-            A = lambda z, **kwargs: classifier(z, **kwargs)
-            Ap = lambda logits, **kwargs: (classifier.pinv(logits, **kwargs))
 
         print(f'Start from {args.subset_start}')
         idx_init = args.subset_start
@@ -309,10 +452,25 @@ class Diffusion(object):
 
                         # Stopping condition: task-dependent error metric
                         if y_cur.dim() == 2:
-                            # Classification: sigmoid-based attribute error
+                            # Classification: sigmoid-based attribute error.
+                            # Bounded in [0, 1]; threshold ~0.1 is meaningful.
                             nlbp_error = (y_cur.sigmoid() - y.sigmoid()).abs().mean()
+                        elif (getattr(args, "task", "classification") == "detection"
+                              and y_cur.dim() == 4
+                              and y_cur.shape[1] == args.detector_num_classes + 4):
+                            # Detection: match the supervised training loss space.
+                            #   hmap channels in probability space (focal-loss-like)
+                            #   regs / w_h_ in raw L1, weighted as in training (1.0 / 0.1)
+                            nc = args.detector_num_classes
+                            e_hmap = (y_cur[:, :nc].sigmoid()
+                                      - y[:, :nc].sigmoid()).abs().mean()
+                            e_regs = (y_cur[:, nc:nc + 2]
+                                      - y[:, nc:nc + 2]).abs().mean()
+                            e_wh = (y_cur[:, nc + 2:nc + 4]
+                                    - y[:, nc + 2:nc + 4]).abs().mean()
+                            nlbp_error = e_hmap + 1.0 * e_regs + 0.1 * e_wh
                         else:
-                            # Detection / spatial output: raw tensor distance
+                            # Generic spatial output: raw tensor distance.
                             nlbp_error = (y_cur - y).abs().mean()
 
                         if nlbp_error > args.nlbp_stop_cond:
@@ -363,14 +521,30 @@ class Diffusion(object):
             grid_path = os.path.join(results_dir, f"grid_{idx_so_far}.png")
             tvu.save_image(res_grid, grid_path)
 
-            # Print classification: true class vs SPNN predictions on original and generated
+            # Per-image diagnostic: how well does A(generated) match A(original)?
             with torch.no_grad():
-                y_orig = A(x_orig)  # SPNN on original
-                y_gen = A(data_transform(config, final_x0.to(self.device)))  # SPNN on generated
-                pred_orig = y_orig.argmax(dim=1).item()
-                pred_gen = y_gen.argmax(dim=1).item()
-                true_cls = classes[0].item() if classes.dim() > 0 else classes.item()
-                print(f"  [img {idx_so_far}] true_class={true_cls} | spnn_on_orig={pred_orig} | spnn_on_generated={pred_gen}")
+                y_orig = A(x_orig)
+                y_gen = A(data_transform(config, final_x0.to(self.device)))
+                if getattr(args, "task", "classification") == "detection":
+                    # Per-component error in the same space as the NLBP stopping
+                    # condition above, so the numbers are comparable across runs.
+                    nc = args.detector_num_classes
+                    e_h = (y_orig[:, :nc].sigmoid()
+                           - y_gen[:, :nc].sigmoid()).abs().mean().item()
+                    e_r = (y_orig[:, nc:nc + 2]
+                           - y_gen[:, nc:nc + 2]).abs().mean().item()
+                    e_w = (y_orig[:, nc + 2:nc + 4]
+                           - y_gen[:, nc + 2:nc + 4]).abs().mean().item()
+                    voc_id = classes[0].item() if classes.dim() > 0 else classes.item()
+                    print(f"  [img {idx_so_far}] voc_id={voc_id} | "
+                          f"hmap_err(prob)={e_h:.4f} regs_err={e_r:.4f} wh_err={e_w:.4f} | "
+                          f"weighted={(e_h + e_r + 0.1*e_w):.4f}")
+                else:
+                    pred_orig = y_orig.argmax(dim=1).item()
+                    pred_gen = y_gen.argmax(dim=1).item()
+                    true_cls = classes[0].item() if classes.dim() > 0 else classes.item()
+                    print(f"  [img {idx_so_far}] true_class={true_cls} | "
+                          f"spnn_on_orig={pred_orig} | spnn_on_generated={pred_gen}")
 
             mse = torch.mean((final_x0[0].to(self.device) - orig) ** 2)
             psnr = 10 * torch.log10(1 / mse)

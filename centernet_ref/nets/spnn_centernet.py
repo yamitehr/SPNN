@@ -37,26 +37,17 @@ class _DeepHeadConvPINNBlock(ConvPINNBlock):
     """
 
     def __init__(self, in_ch, out_ch, hidden=64, scale_bound=2.,
-                 img_size=32, mix_type="householder", feat_size=None,
-                 mlp_tail_hidden=0):
+                 img_size=32, mix_type="householder", feat_size=None):
         super().__init__(in_ch=in_ch, out_ch=out_ch, hidden=hidden,
                          scale_bound=scale_bound, img_size=img_size,
                          mix_type=mix_type, feat_size=feat_size)
-        # Replace shallow t/s/r with the deeper variant.  When
-        # mlp_tail_hidden > 0, each ConvMLP appends a per-pixel MLP residual
-        # after its U-net (zero-init last conv → identity at step 0), adding
-        # nonlinear channel-direction capacity inside s/t/r.  Bijectivity is
-        # unchanged: the coupling y = x0 * s(x1) + t(x1) is invertible for any
-        # deterministic s, t — the tail just makes them deeper.
+        # Replace shallow t/s/r with the deeper variant.
         self.t = _DeeperConvMLP(in_ch - out_ch, out_ch, None, hidden,
-                                img_size=img_size, feat_size=feat_size,
-                                mlp_tail_hidden=mlp_tail_hidden)
+                                img_size=img_size, feat_size=feat_size)
         self.s = _DeeperConvMLP(in_ch - out_ch, out_ch, scale_bound, hidden,
-                                img_size=img_size, feat_size=feat_size,
-                                mlp_tail_hidden=mlp_tail_hidden)
+                                img_size=img_size, feat_size=feat_size)
         self.r = _DeeperConvMLP(out_ch, in_ch - out_ch, None, hidden,
-                                img_size=img_size, feat_size=feat_size,
-                                mlp_tail_hidden=mlp_tail_hidden)
+                                img_size=img_size, feat_size=feat_size)
 
 
 def transfer_backbone_from_classifier(cls_checkpoint_path, spnn_model):
@@ -131,7 +122,8 @@ class SPNNCenterNet(nn.Module):
                  hmap_init_bias=-2.19,
                  head_mode='affine', head_mix_type='householder',
                  head_mix_reflections=None,
-                 freeze_backbone=False, num_backbone_blocks=4):
+                 freeze_backbone=False, num_backbone_blocks=4,
+                 no_hmap_scale=False, no_hmap_bias=False):
         super().__init__()
         self.spnn = spnn
         self.num_classes = num_classes
@@ -144,8 +136,16 @@ class SPNNCenterNet(nn.Module):
         # and the head, so gradients flow only into head blocks + adapter.
         self.freeze_backbone = freeze_backbone
         self.num_backbone_blocks = num_backbone_blocks
-        self.hmap_scale = nn.Parameter(torch.ones(1, num_classes, 1, 1) * hmap_init_scale)
-        self.hmap_bias = nn.Parameter(torch.full((1, num_classes, 1, 1), float(hmap_init_bias)))
+        # When no_hmap_scale / no_hmap_bias are set, the corresponding
+        # parameter is not constructed at all (not just initialized to 1/0)
+        # and the matching op is skipped in forward / hmap_to_raw — so the
+        # spnn's raw hmap channels become the detection logits directly.
+        self.use_hmap_scale = not no_hmap_scale
+        self.use_hmap_bias = not no_hmap_bias
+        if self.use_hmap_scale:
+            self.hmap_scale = nn.Parameter(torch.ones(1, num_classes, 1, 1) * hmap_init_scale)
+        if self.use_hmap_bias:
+            self.hmap_bias = nn.Parameter(torch.full((1, num_classes, 1, 1), float(hmap_init_bias)))
         if head_mode == 'orthogonal_mix':
             if head_mix_type == 'cayley':
                 self.hmap_mix = Cayley1x1Conv(num_classes)
@@ -181,10 +181,13 @@ class SPNNCenterNet(nn.Module):
         else:
             raw = self.spnn(x)  # [B, num_classes+4, H/4, W/4]
         hmap_raw = raw[:, :self.num_classes]
-        hmap = hmap_raw * self.hmap_scale  # per-channel rescale
+        hmap = hmap_raw
+        if self.use_hmap_scale:
+            hmap = hmap * self.hmap_scale  # per-channel rescale
         if self.head_mode == 'orthogonal_mix':
             hmap = self.hmap_mix(hmap)     # 20×20 orthogonal channel mix
-        hmap = hmap + self.hmap_bias       # per-channel offset
+        if self.use_hmap_bias:
+            hmap = hmap + self.hmap_bias   # per-channel offset
         regs = raw[:, self.num_classes:self.num_classes + 2]  # [B, 2, H/4, W/4]
         w_h_ = raw[:, self.num_classes + 2:]  # [B, 2, H/4, W/4]
         return [[hmap, regs, w_h_]]
@@ -194,10 +197,14 @@ class SPNNCenterNet(nn.Module):
 
         Used by the pinv / DDNM chain — apply this first, then SPNN.pinv.
         """
-        y = hmap - self.hmap_bias.to(hmap.device)
+        y = hmap
+        if self.use_hmap_bias:
+            y = y - self.hmap_bias.to(hmap.device)
         if self.head_mode == 'orthogonal_mix':
             y = self.hmap_mix.inverse(y)  # apply W^T
-        return y / self.hmap_scale.to(hmap.device)
+        if self.use_hmap_scale:
+            y = y / self.hmap_scale.to(hmap.device)
+        return y
 
     def pinv(self, hmap, regs, w_h_, latents=None):
         """Right-inverse of forward: y = [hmap, regs, w_h_]  →  reconstructed image.
@@ -221,9 +228,9 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
                          head_mix_type='householder',
                          head_mix_reflections=None,
                          deep_det_head=False, deep_head_hidden=128,
-                         mlp_tail_hidden=0,
                          two_block_head=False,
-                         freeze_backbone=False):
+                         freeze_backbone=False,
+                         no_hmap_scale=False, no_hmap_bias=False):
     """Build end-to-end invertible SPNN for CenterNet detection.
 
     Architecture (Option C: multi-scale 128+64):
@@ -253,8 +260,6 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
                   "hidden": deep_head_hidden if deep_det_head else hidden,
                   "scale_bound": scale_bound, "feat_size": 64,
                   "mix_type": mix_type}
-        if deep_det_head:
-            kwargs["mlp_tail_hidden"] = mlp_tail_hidden
         return (cls, kwargs)
 
     layer_channels = [
@@ -299,7 +304,9 @@ def build_spnn_centernet(num_classes=20, hidden=256, mix_type="householder",
                          head_mix_type=head_mix_type,
                          head_mix_reflections=head_mix_reflections,
                          freeze_backbone=freeze_backbone,
-                         num_backbone_blocks=4)
+                         num_backbone_blocks=4,
+                         no_hmap_scale=no_hmap_scale,
+                         no_hmap_bias=no_hmap_bias)
 
 
 def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
@@ -308,9 +315,9 @@ def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
                        head_mix_type='householder',
                        head_mix_reflections=None,
                        deep_det_head=False, deep_head_hidden=128,
-                       mlp_tail_hidden=0,
                        two_block_head=False,
-                       freeze_backbone=False):
+                       freeze_backbone=False,
+                       no_hmap_scale=False, no_hmap_bias=False):
     """Entry point matching CenterNet's model creation pattern."""
     return build_spnn_centernet(num_classes=num_classes,
                                 pretrained_backbone=pretrained_backbone,
@@ -321,6 +328,7 @@ def get_spnn_centernet(num_classes=20, pretrained_backbone=None,
                                 head_mix_reflections=head_mix_reflections,
                                 deep_det_head=deep_det_head,
                                 deep_head_hidden=deep_head_hidden,
-                                mlp_tail_hidden=mlp_tail_hidden,
                                 two_block_head=two_block_head,
-                                freeze_backbone=freeze_backbone)
+                                freeze_backbone=freeze_backbone,
+                                no_hmap_scale=no_hmap_scale,
+                                no_hmap_bias=no_hmap_bias)

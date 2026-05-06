@@ -45,23 +45,6 @@ class _UNet3Skip(nn.Module):
         return self.final(d1)
 
 
-def _build_mlp_tail(channels: int, hidden: int) -> nn.Sequential:
-    """Per-pixel MLP applied to a (B, channels, H, W) tensor.
-    Last 1×1 conv is zero-init so the tail outputs all-zeros at construction;
-    callers add it as a residual: x = x + tail(x), so init behavior is identity.
-    """
-    g_h = _gn_groups(hidden)
-    final = nn.Conv2d(hidden, channels, kernel_size=1)
-    nn.init.zeros_(final.weight)
-    nn.init.zeros_(final.bias)
-    return nn.Sequential(
-        nn.Conv2d(channels, hidden, kernel_size=1),
-        nn.GroupNorm(g_h, hidden), nn.GELU(),
-        nn.Conv2d(hidden, hidden, kernel_size=1),
-        nn.GroupNorm(g_h, hidden), nn.GELU(),
-        final,
-    )
-
 class BaseOrthogonal1x1Conv(nn.Module):
     """
     Base class for orthogonal 1x1 convolutions.
@@ -308,15 +291,12 @@ class PatchHouseholderMix(BasePatchOrthogonalMix):
 
 class ConvMLP(nn.Module):
     def __init__(self, in_ch, out_ch, scale_bound, hidden_ch, img_size: int = 32,
-                 feat_size: int = None, mlp_tail_hidden: int = 0):
+                 feat_size: int = None):
         super().__init__()
         self.in_ch = in_ch
         self.out_ch = out_ch
         self.scale_bound = scale_bound
         self.img_size = img_size
-        # Optional per-pixel MLP applied as a residual on top of self.net's output.
-        # Built below after self.net, since we need out_ch (which is well-defined here).
-        self.mlp_tail_hidden = mlp_tail_hidden
 
         # ===== img_size=256: Block1 (64x64) =====
         if self.img_size == 256 and in_ch == 36 and out_ch == 12:
@@ -597,24 +577,9 @@ class ConvMLP(nn.Module):
         else:
             self.net = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
 
-        # Build optional MLP tail.  Skipped for the constant-bias branch
-        # (in_ch == 0) since there is no spatial input to enrich.
-        self.tail = None
-        if mlp_tail_hidden > 0 and self.in_ch > 0:
-            self.tail = _build_mlp_tail(out_ch, mlp_tail_hidden)
-
     def forward(self, x, neg=False):
         if self.in_ch > 0:
             x = self.net(x)
-            if self.tail is not None:
-                # Residual MLP tail: zero-init last conv → tail(x) = 0 at step 0,
-                # so this is bit-identical to the no-tail forward until the tail
-                # weights move during training.  For the s-network, this residual
-                # acts in the pre-tanh logit space, so the multiplicative scale
-                # stays strictly positive and the inverse (neg=True) round-trip
-                # remains exact (s_full(x1) and s_full(x1, neg=True) traverse
-                # the same tail with opposite sign on the bounded factor).
-                x = x + self.tail(x)
         else:
             B, _, H, W = x.shape
             x = self.net.expand(B, self.out_ch, H, W)

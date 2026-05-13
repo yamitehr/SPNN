@@ -27,7 +27,7 @@ model:
     var_type: 'fixedsmall'
     num_head_channels: 64
     image_size: 256
-    class_cond: true
+    class_cond: false
     use_new_attention_order: false
 
 diffusion:

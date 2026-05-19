@@ -44,62 +44,77 @@ from torch.utils.data import Subset
 
 from models import SPNN, ConvPINNBlock, PixelUnshuffleBlock
 
+# centernet_ref/nets/spnn_centernet.py defines _DeepHeadConvPINNBlock — the
+# variant that uses models_deeper.ConvMLP for s/t/r. We reuse it for the
+# shared backbone+head so the weights load 1-to-1 into the detector wrapper.
+import sys as _sys
+_centernet_ref_path = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), 'centernet_ref')
+if _centernet_ref_path not in _sys.path:
+    _sys.path.insert(0, _centernet_ref_path)
+from nets.spnn_centernet import _DeepHeadConvPINNBlock  # noqa: E402
 
-def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley", scale_bound=2.0):
-    """Build SPNN for classification with Option C backbone (multi-scale 128+64)."""
+
+def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley",
+                              scale_bound=2.0, deep_block_hidden=128):
+    """Build SPNN for classification.
+
+    Architecture (designed to maximize transfer to SPNN-CenterNet detector):
+
+      Stem:    PixelUnshuffle(4)                    [3,256,256] → [48,64,64]
+      Shared backbone (6 deep ConvSPNN, x1=4 ladder; transferred to detector):
+        ConvSPNN(48→44) deep                        [48,64,64] → [44,64,64]
+        ConvSPNN(44→40) deep
+        ConvSPNN(40→36) deep
+        ConvSPNN(36→32) deep
+        ConvSPNN(32→28) deep
+        ConvSPNN(28→24) deep                        [24,64,64]  ← head boundary
+      Classifier-only tail (3 shallow ConvSPNN):
+        PixelUnshuffle(4)                           [24,64,64] → [384,16,16]
+        ConvSPNN(384→64)                            ratio 6
+        PixelUnshuffle(4)                           [64,16,16] → [1024,4,4]
+        ConvSPNN(1024→256)                          ratio 4
+        PixelUnshuffle(4)                           [256,4,4]  → [4096,1,1]
+        ConvSPNN(4096→num_classes)                  ratio ~4 (for num_classes=1000)
+
+    The first 6 ConvSPNN blocks (`48→44→40→36→32→28→24` at 64×64) form the
+    shared backbone with the detector: they use _DeepHeadConvPINNBlock with
+    no internal-affine init. The detector reuses the same 6 blocks and adds
+    learnable `final_bias` / `final_log_scale` on the LAST block's t/s
+    (initialized from hmap_init_bias / log(hmap_init_scale)). All weights
+    except those two new params transfer 1-to-1 from classifier to detector.
+    """
+    deep_kwargs = lambda i, o: {
+        "in_ch": i, "out_ch": o, "hidden": deep_block_hidden,
+        "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type,
+    }
     layer_channels = [
-        # Backbone (shared with CenterNet detector)
-        # 128x128 processing
-        (PixelUnshuffleBlock, {"r": 2}),
-        (ConvPINNBlock, {"in_ch": 12, "out_ch": 8, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 128, "mix_type": mix_type}),
-        # 64x64 processing
-        (PixelUnshuffleBlock, {"r": 2}),
-        (ConvPINNBlock, {"in_ch": 32, "out_ch": 28, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
-        (ConvPINNBlock, {"in_ch": 28, "out_ch": 24, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
-        # Classification head (below backbone)
-        (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
+        # ----- Stem -----
         (PixelUnshuffleBlock, {"r": 4}),
-        (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
-        (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
+        # ----- Shared backbone (6 deep ConvSPNN, x1=4 ladder) -----
+        # Transferred 1-to-1 into the SPNN-CenterNet wrapper.
+        (_DeepHeadConvPINNBlock, deep_kwargs(48, 44)),
+        (_DeepHeadConvPINNBlock, deep_kwargs(44, 40)),
+        (_DeepHeadConvPINNBlock, deep_kwargs(40, 36)),
+        (_DeepHeadConvPINNBlock, deep_kwargs(36, 32)),
+        (_DeepHeadConvPINNBlock, deep_kwargs(32, 28)),
+        # Head boundary: detector takes everything through here, then adds
+        # final_bias / final_log_scale on this block's t/s ConvMLPs.
+        (_DeepHeadConvPINNBlock, deep_kwargs(28, 24)),
+        # ----- Classifier-only tail (3 shallow ConvSPNN) -----
         (PixelUnshuffleBlock, {"r": 4}),
-        (ConvPINNBlock, {"in_ch": 768, "out_ch": 192, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 4, "mix_type": mix_type}),
+        (ConvPINNBlock, {"in_ch": 384, "out_ch": 64, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 16,
+                         "mix_type": mix_type}),
         (PixelUnshuffleBlock, {"r": 4}),
-        (ConvPINNBlock, {"in_ch": 3072, "out_ch": 1024, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
-        (ConvPINNBlock, {"in_ch": 1024, "out_ch": num_classes, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
+        (ConvPINNBlock, {"in_ch": 1024, "out_ch": 256, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 4,
+                         "mix_type": mix_type}),
+        (PixelUnshuffleBlock, {"r": 4}),
+        (ConvPINNBlock, {"in_ch": 4096, "out_ch": num_classes, "hidden": hidden,
+                         "scale_bound": scale_bound, "feat_size": 1,
+                         "mix_type": mix_type}),
     ]
-
-    # # Previous architecture (PixelUnshuffle(4) backbone):
-    # layer_channels = [
-    #     # Backbone (shared with detection)
-    #     (PixelUnshuffleBlock, {"r": 4}),
-    #     (ConvPINNBlock, {"in_ch": 48, "out_ch": 24, "hidden": hidden,
-    #                      "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
-    #     (ConvPINNBlock, {"in_ch": 24, "out_ch": 12, "hidden": hidden,
-    #                      "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type}),
-    #     (PixelUnshuffleBlock, {"r": 4}),
-    #     (ConvPINNBlock, {"in_ch": 192, "out_ch": 96, "hidden": hidden,
-    #                      "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
-    #     (ConvPINNBlock, {"in_ch": 96, "out_ch": 48, "hidden": hidden,
-    #                      "scale_bound": scale_bound, "feat_size": 16, "mix_type": mix_type}),
-    #     # Classification head
-    #     (PixelUnshuffleBlock, {"r": 4}),
-    #     (ConvPINNBlock, {"in_ch": 768, "out_ch": 192, "hidden": hidden,
-    #                      "scale_bound": scale_bound, "feat_size": 4, "mix_type": mix_type}),
-    #     (PixelUnshuffleBlock, {"r": 4}),
-    #     (ConvPINNBlock, {"in_ch": 3072, "out_ch": 1024, "hidden": hidden,
-    #                      "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
-    #     (ConvPINNBlock, {"in_ch": 1024, "out_ch": num_classes, "hidden": hidden,
-    #                      "scale_bound": scale_bound, "feat_size": 1, "mix_type": mix_type}),
-    # ]
 
     return SPNN(
         img_ch=3, num_classes=num_classes, img_size=256,
@@ -190,6 +205,13 @@ parser.add_argument('--mix-type', default='householder', type=str,
                     help='orthogonal mixing layer type (default: householder)')
 parser.add_argument('--scale-bound', default=2.0, type=float,
                     help='scale bound for s-network: s in [exp(-b), exp(b)] (default: 2.0)')
+parser.add_argument('--deep-block-hidden', default=128, type=int,
+                    help='Hidden width for the 6 deep ConvSPNN blocks at '
+                         '64x64 (the shared backbone+head). Each block uses '
+                         'models_deeper.ConvMLP with a 3-level U-net of '
+                         'widths h, 2h, 4h. Default: 128 (matches the '
+                         'detector convention). 256 ~quadruples the deep '
+                         'backbone param count.')
 
 best_acc1 = 0
 
@@ -269,7 +291,10 @@ def main_worker(gpu, ngpus_per_node, args):
                                 world_size=args.world_size, rank=args.rank)
     # create SPNN classification model
     print(f"=> creating SPNN classification model (num_classes={args.num_classes})")
-    model = build_classification_spnn(num_classes=args.num_classes, mix_type=args.mix_type, scale_bound=args.scale_bound)
+    model = build_classification_spnn(num_classes=args.num_classes,
+                                      mix_type=args.mix_type,
+                                      scale_bound=args.scale_bound,
+                                      deep_block_hidden=args.deep_block_hidden)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   Total params: {total_params:,}")
 

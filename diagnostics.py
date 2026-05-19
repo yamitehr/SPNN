@@ -11,19 +11,35 @@ class PenroseChecker:
         self.logger = logger
 
     @torch.no_grad()
-    def run_penrose_batched(self, checkpoint_path, test_loader, device, img_ch, num_classes, hidden, scale_bound, img_size):
-        """Tests the Penrose and specific inverse identities."""
-        net = SPNN(img_ch=img_ch, num_classes=num_classes, hidden=hidden, scale_bound=scale_bound, img_size=img_size).to(device)
+    def run_penrose_batched(self, checkpoint_path, test_loader, device,
+                            img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=256,
+                            mix_type="cayley", model_cls=None, model_kwargs=None):
+        """Tests the Penrose and specific inverse identities.
+
+        Supports two calling conventions:
+          1. Legacy (classification): pass img_ch, num_classes, hidden, scale_bound, img_size
+          2. General (any architecture): pass model_cls=SPNN, model_kwargs={...}
+        """
+        if model_cls is not None and model_kwargs is not None:
+            net = model_cls(**model_kwargs).to(device)
+        else:
+            net = SPNN(img_ch=img_ch, num_classes=num_classes, hidden=hidden,
+                       scale_bound=scale_bound, img_size=img_size, mix_type=mix_type).to(device)
         state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
         net.load_state_dict(state_dict)
         net.eval()
         mse_fn = nn.MSELoss(reduction="mean")
         err_ggg_sum, err_g_prime_sum, err_gg_prime_sum, n_batches = 0.0, 0.0, 0.0, 0
 
+        # Determine output shape from a probe forward pass
+        sample_img = next(iter(test_loader))[0][:1].to(device)
+        sample_out = net(sample_img)
+        output_shape = sample_out.shape[1:]  # e.g. (40,) or (25, 8, 8)
+
         for images, _ in tqdm(test_loader, desc="Penrose check"):
             images = images.to(device, non_blocking=True)
             B = images.shape[0]
-            y = torch.randn(B, num_classes, device=device)
+            y = torch.randn(B, *output_shape, device=device)
 
             # 1. Test gg'g = g
             y_g = net(images)
@@ -55,9 +71,15 @@ class PenroseChecker:
         return metrics
 
     @torch.no_grad()
-    def run_penrose(self, checkpoint_path, test_loader, device, img_ch, num_classes, hidden, scale_bound, img_size):
+    def run_penrose(self, checkpoint_path, test_loader, device,
+                    img_ch=3, num_classes=40, hidden=128, scale_bound=2.0, img_size=256,
+                    mix_type="cayley", model_cls=None, model_kwargs=None):
         """Tests the Penrose and specific inverse identities."""
-        net = SPNN(img_ch=img_ch, num_classes=num_classes, hidden=hidden, scale_bound=scale_bound, img_size=img_size).to(device)
+        if model_cls is not None and model_kwargs is not None:
+            net = model_cls(**model_kwargs).to(device)
+        else:
+            net = SPNN(img_ch=img_ch, num_classes=num_classes, hidden=hidden,
+                       scale_bound=scale_bound, img_size=img_size, mix_type=mix_type).to(device)
         state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
         net.load_state_dict(state_dict)
         net.eval()
@@ -66,7 +88,11 @@ class PenroseChecker:
             imgs.append(images)
         images_all = torch.cat(imgs, dim=0).to(device)
         N = images_all.shape[0]
-        y = torch.randn(N, num_classes, device=device)
+
+        # Determine output shape from a probe forward pass
+        sample_out = net(images_all[:1])
+        output_shape = sample_out.shape[1:]  # e.g. (40,) or (25, 8, 8)
+        y = torch.randn(N, *output_shape, device=device)
         mse_fn = nn.MSELoss(reduction="mean")
 
         # 1. Test gg'g = g

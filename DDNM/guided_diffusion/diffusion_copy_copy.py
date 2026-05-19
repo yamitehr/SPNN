@@ -258,7 +258,7 @@ class Diffusion(object):
         for p in (_project_root, _centernet_ref):
             if p not in _sys.path:
                 _sys.path.insert(0, p)
-        from nets.spnn_centernet_copy import get_spnn_centernet  # noqa: E402
+        from nets.spnn_centernet import get_spnn_centernet  # noqa: E402
 
         assert args.detector_ckpt is not None, \
             "Must provide --detector_ckpt for detection DDNM"

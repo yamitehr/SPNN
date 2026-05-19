@@ -94,7 +94,7 @@ def parse_args_and_config():
     parser.add_argument("--detector_head_mix_reflections", type=int, default=0)
     parser.add_argument("--detector_hmap_init_scale", type=float, default=0.01)
     parser.add_argument("--detector_hmap_init_bias", type=float, default=-2.19)
-    # Match the train_copy.py training-time toggles. When the checkpoint was
+    # Match the train.py training-time toggles. When the checkpoint was
     # trained with --no_hmap_scale --no_hmap_bias --internal_head_affine, the
     # external scale/bias parameters don't exist in the state_dict and the
     # affine lives inside the last head block's s/t — these flags must match

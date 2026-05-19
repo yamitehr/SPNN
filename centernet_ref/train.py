@@ -99,6 +99,20 @@ parser.add_argument('--no_hmap_bias', action='store_true',
                          'Forces the spnn raw hmap channels to encode the '
                          'detection-logit floor (~-2 for negatives) instead '
                          'of relying on a learned shift.')
+parser.add_argument('--internal_head_affine', action='store_true',
+                    help='Add learnable per-output-channel affine INSIDE the '
+                         "head's s and t networks (the ConvMLPs). "
+                         'self.t.final_bias (additive, init from hmap_init_bias '
+                         'on hmap channels, 0 on regs/wh) and '
+                         'self.s.final_log_scale (multiplicative on the s '
+                         'output, init from log(hmap_init_scale) on hmap, '
+                         '0 on regs/wh). Both are nn.Parameter — learned '
+                         'via the optimizer like any other weight, saved in '
+                         'state_dict, and bijectivity-preserving (the s '
+                         'inverse uses sign-flipped log_scale via the neg '
+                         'flag). Intended use: combined with --no_hmap_scale '
+                         '--no_hmap_bias to relocate the affine from the '
+                         'external head into s/t.')
 parser.add_argument('--img_size', type=int, default=512)
 parser.add_argument('--split_ratio', type=float, default=1.0)
 
@@ -136,6 +150,27 @@ parser.add_argument('--lambda_img_rec', type=float, default=0.0,
                          'inverse. ~Doubles per-step compute when > 0. '
                          'Only applies to --arch spnn.')
 
+# r-net-only training phase. Loads from --pretrain_name, freezes everything
+# except the per-block r-nets, and trains them with G-norm + reconstruction
+# + cycle losses (the recipe from train.py:_train_r_opt_classifier, adapted
+# to the SPNN-CenterNet wrapper). Assumes the ckpt was trained with
+# --no_hmap_scale --no_hmap_bias --internal_head_affine; head_mode is
+# inferred from the ckpt's state_dict (presence of hmap_mix.*).
+parser.add_argument('--only_train_r', action='store_true',
+                    help='r-net-only training phase. Freezes everything '
+                         'except .r submodules; loads init from '
+                         '--pretrain_name. Skips detection-loss path entirely.')
+parser.add_argument('--lambda_r_norm', type=float, default=1.0,
+                    help='Weight for G-norm loss '
+                         '||z(pinv(forward(x))) - z(zeros)||² (latent reg).')
+parser.add_argument('--lambda_r_rec', type=float, default=1.0,
+                    help='Weight for image reconstruction loss '
+                         '||pinv(forward(x)) - x||² in r-only mode.')
+parser.add_argument('--lambda_r_cycle', type=float, default=1.0,
+                    help='Weight for right-inverse cycle loss '
+                         '||forward(pinv(forward(x))) - forward(x)||² in '
+                         'r-only mode.')
+
 # Varifocal loss for the heatmap (quality-aware classification target)
 parser.add_argument('--vfl', action='store_true',
                     help='Use varifocal-style heatmap loss: positive target '
@@ -170,6 +205,125 @@ os.makedirs(cfg.log_dir, exist_ok=True)
 os.makedirs(cfg.ckpt_dir, exist_ok=True)
 
 cfg.lr_step = [int(s) for s in cfg.lr_step.split(',')]
+
+
+def train_r_only(model, train_loader, train_sampler, cfg, device, logger, wandb_run):
+    """R-net-only training phase.
+
+    Adapted from train.py:_train_r_opt_classifier for the SPNN-CenterNet
+    wrapper. Freezes everything except the per-block .r submodules and
+    optimizes them with two losses:
+      - lambda_r_norm  * ||z(pinv(forward(x))) - z(zeros)||²    (G-norm)
+      - lambda_r_rec   * ||pinv(forward(x))    - x||²            (image rec)
+
+    Assumes the wrapper was loaded from a ckpt with no_hmap_scale=True,
+    no_hmap_bias=True, internal_head_affine=True (so the affine lives inside
+    s/t in the last head block). head_mode is whatever was inferred earlier.
+    The forward path is frozen, so detection performance is preserved exactly.
+    """
+    detector = model.module if hasattr(model, 'module') else model
+
+    # Freeze everything; collect r-net params.
+    for p in model.parameters():
+        p.requires_grad_(False)
+    r_params = []
+    for m in model.modules():
+        # Catches ConvPINNBlock and any subclass (e.g. _DeepHeadConvPINNBlock)
+        # without needing direct imports — duck-type on (s, t, r) attrs.
+        if (hasattr(m, 'r') and hasattr(m, 's') and hasattr(m, 't')
+                and isinstance(getattr(m, 'r'), nn.Module)):
+            for p in m.r.parameters():
+                p.requires_grad_(True)
+                r_params.append(p)
+    assert r_params, ("[r-opt] no r-params found — expected ConvPINNBlock-"
+                      "shaped modules with .r submodules.")
+    n_r = sum(p.numel() for p in r_params)
+    if cfg.local_rank == 0:
+        logger.info(f"[r-opt] trainable r-params: {len(r_params)} tensors, "
+                    f"{n_r/1e6:.2f}M params")
+
+    opt = torch.optim.Adam(r_params, lr=cfg.lr)
+
+    for ep in range(cfg.num_epochs):
+        if cfg.dist and train_sampler is not None:
+            train_sampler.set_epoch(ep)
+        model.train()
+        ep_loss = ep_g = ep_rec = 0.0
+        ep_steps = 0
+        t0 = time.perf_counter()
+        for batch in train_loader:
+            x = batch['image'].to(device, non_blocking=True)
+
+            # Forward through frozen wrapper. With internal-affine, the
+            # per-class scale/bias is baked into the last block's s/t and
+            # gets applied here automatically.
+            with torch.no_grad():
+                out = detector(x)
+                hmap, regs, wh = out[0]
+
+            # Pinv via r-nets — gradients flow through r-net params.
+            x_tag = detector.pinv(hmap, regs, wh, latents=None)
+
+            # G-norm: latents at x_tag (with grad → r) vs at zero-input
+            # (no grad — fixed reference). Routed through `model` (the DDP
+            # wrapper) so DDP's per-iteration prepare_for_backward / DDPSink
+            # fire and r-param gradients are correctly allreduced.
+            _, z_list = model(x_tag, return_latents=True)
+            with torch.no_grad():
+                _, z_list_0 = detector(torch.zeros_like(x_tag),
+                                       return_latents=True)
+            B = x.size(0)
+            parts, parts_0 = [], []
+            for z, z0 in zip(z_list, z_list_0):
+                if z is None:
+                    continue
+                parts.append(z.view(B, -1))
+                parts_0.append(z0.view(B, -1))
+            G_pinv = torch.cat(parts, dim=1)
+            G_0 = torch.cat(parts_0, dim=1)
+            loss_G = (G_pinv - G_0).pow(2).mean()
+
+            # Image reconstruction.
+            loss_rec = (x_tag - x).pow(2).mean()
+
+            loss = (cfg.lambda_r_norm * loss_G
+                    + cfg.lambda_r_rec * loss_rec)
+
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(r_params, max_norm=1.0)
+            opt.step()
+
+            ep_loss += loss.item()
+            ep_g += loss_G.item()
+            ep_rec += loss_rec.item()
+            ep_steps += 1
+
+        n = max(1, ep_steps)
+        dur = time.perf_counter() - t0
+        if cfg.local_rank == 0:
+            logger.info(f"[r-opt] epoch {ep+1}/{cfg.num_epochs} "
+                        f"({dur:.1f}s, {ep_steps} steps): "
+                        f"loss={ep_loss/n:.5f} "
+                        f"g={ep_g/n:.5f} rec={ep_rec/n:.5f}")
+            if wandb_run is not None:
+                wandb_run.log({
+                    'r_opt/epoch': ep + 1,
+                    'r_opt/loss_total': ep_loss / n,
+                    'r_opt/loss_G': ep_g / n,
+                    'r_opt/loss_rec': ep_rec / n,
+                })
+
+        # Periodic + final save (rank 0).
+        if cfg.local_rank == 0 and ((ep + 1) % 10 == 0
+                                    or (ep + 1) == cfg.num_epochs):
+            ckpt_name = ('checkpoint.t7' if (ep + 1) == cfg.num_epochs
+                         else f'r_opt_epoch_{ep+1}.t7')
+            ckpt_path = os.path.join(cfg.ckpt_dir, ckpt_name)
+            save_state = (model.module if hasattr(model, 'module') else model
+                          ).state_dict()
+            torch.save(save_state, ckpt_path)
+            logger.info(f"[r-opt] saved {ckpt_path}")
 
 
 def main():
@@ -226,6 +380,34 @@ def main():
                                            shuffle=False, num_workers=1, pin_memory=True,
                                            collate_fn=val_dataset.collate_fn)
 
+  # In --only_train_r mode, peek at the pretrained ckpt and infer
+  # head_mode (orthogonal_mix iff any 'hmap_mix' key exists). Force the
+  # internal-affine layout that all r-opt-eligible ckpts use, so the
+  # constructed model matches what the ckpt holds without ambiguity.
+  if cfg.only_train_r:
+    assert os.path.isfile(cfg.pretrain_dir), (
+        f"--only_train_r requires --pretrain_name pointing at a ckpt; "
+        f"none found at {cfg.pretrain_dir}")
+    _raw = torch.load(cfg.pretrain_dir, map_location='cpu', weights_only=False)
+    if isinstance(_raw, dict) and 'state_dict' in _raw:
+      _state = _raw['state_dict']
+    elif isinstance(_raw, dict) and 'model' in _raw:
+      _state = _raw['model']
+    else:
+      _state = _raw
+    _state = {k[7:] if k.startswith('module.') else k: v
+              for k, v in _state.items()}
+    inferred_head_mode = ('orthogonal_mix'
+                          if any('hmap_mix' in k for k in _state)
+                          else 'affine')
+    print(f'[r-opt] inferred head_mode={inferred_head_mode} from ckpt'
+          f' (overriding --head_mode={cfg.head_mode})')
+    cfg.head_mode = inferred_head_mode
+    cfg.no_hmap_scale = True
+    cfg.no_hmap_bias = True
+    cfg.internal_head_affine = True
+    cfg._r_init_state = _state  # reused after model construction
+
   print('Creating model...')
   if 'hourglass' in cfg.arch:
     from nets.hourglass import get_hourglass
@@ -254,9 +436,27 @@ def main():
                                two_block_head=cfg.two_block_head,
                                freeze_backbone=cfg.freeze_backbone,
                                no_hmap_scale=cfg.no_hmap_scale,
-                               no_hmap_bias=cfg.no_hmap_bias)
+                               no_hmap_bias=cfg.no_hmap_bias,
+                               internal_head_affine=cfg.internal_head_affine)
   else:
     raise NotImplementedError
+
+  # r-opt: load ckpt into the BARE model BEFORE DDP wraps it. Otherwise
+  # the existing post-DDP load_model() path silently no-ops because the
+  # DDP-wrapped model's state_dict keys are prefixed with 'module.' but
+  # load_model only strips that prefix, never adds it -> all keys marked
+  # missing, weights stay at init.
+  if cfg.only_train_r:
+    miss, unex = model.load_state_dict(cfg._r_init_state, strict=False)
+    if cfg.local_rank == 0:
+      print(f'[r-opt] loaded ckpt {cfg.pretrain_dir}: '
+            f'missing={len(miss)}, unexpected={len(unex)}')
+      if miss:
+        print(f'[r-opt] first missing keys: {miss[:6]}')
+      if unex:
+        print(f'[r-opt] first unexpected keys: {unex[:6]}')
+    # release the stashed state_dict (saves ~600MB of CPU RAM)
+    del cfg._r_init_state
 
   if cfg.dist:
     # model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
@@ -282,8 +482,20 @@ def main():
   else:
     model = nn.DataParallel(model).to(cfg.device)
 
-  if os.path.isfile(cfg.pretrain_dir):
+  # Skip the post-DDP load_model() path in r-opt mode — we already loaded
+  # the state_dict into the bare model above (which works correctly with
+  # DDP's 'module.' key prefix, unlike load_model).
+  if not cfg.only_train_r and os.path.isfile(cfg.pretrain_dir):
     model = load_model(model, cfg.pretrain_dir)
+
+  # r-net-only training: branch off here. Skips teacher / detection loss /
+  # main optimizer entirely. Everything below this point is detection-only.
+  if cfg.only_train_r:
+    train_r_only(model, train_loader, train_sampler, cfg,
+                 cfg.device, logger, wandb_run)
+    if wandb_run is not None and cfg.local_rank == 0:
+      wandb_run.finish()
+    return
 
   teacher_model = None
   if cfg.teacher_arch is not None and cfg.teacher_checkpoint is not None:

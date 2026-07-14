@@ -45,17 +45,8 @@ def parse_args_and_config():
     parser.add_argument("--detector_deep_det_head", action="store_true")
     parser.add_argument("--detector_deep_head_hidden", type=int, default=128)
     parser.add_argument("--detector_two_block_head", action="store_true")
-    parser.add_argument("--detector_head_mode", type=str, default="affine",
-                        choices=["affine", "orthogonal_mix"])
-    parser.add_argument("--detector_head_mix_type", type=str,
-                        default="householder",
-                        choices=["cayley", "householder"])
-    parser.add_argument("--detector_head_mix_reflections", type=int, default=0)
     parser.add_argument("--detector_hmap_init_scale", type=float, default=0.01)
     parser.add_argument("--detector_hmap_init_bias", type=float, default=-2.19)
-    parser.add_argument("--no_hmap_scale", action="store_true")
-    parser.add_argument("--no_hmap_bias", action="store_true")
-    parser.add_argument("--internal_head_affine", action="store_true")
     parser.add_argument("--detector_scale_bound", type=float, default=1.0)
     parser.add_argument("--detector_mix_type", type=str, default="householder",
                         choices=["cayley", "householder"])

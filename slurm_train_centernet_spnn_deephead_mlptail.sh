@@ -49,9 +49,6 @@ trap cleanup SIGTERM
 
 python train.py \
     --arch spnn \
-    --head_mode orthogonal_mix \
-    --head_mix_type householder \
-    --head_mix_reflections 20 \
     --deep_det_head \
     --deep_head_hidden 256 \
     --mlp_tail_hidden 128 \

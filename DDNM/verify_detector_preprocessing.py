@@ -65,9 +65,6 @@ def main():
     ap.add_argument("--detector_deep_det_head", action="store_true")
     ap.add_argument("--detector_deep_head_hidden", type=int, default=128)
     ap.add_argument("--detector_two_block_head", action="store_true")
-    ap.add_argument("--detector_head_mode", default="affine")
-    ap.add_argument("--detector_head_mix_type", default="householder")
-    ap.add_argument("--detector_head_mix_reflections", type=int, default=0)
     ap.add_argument("--detector_hmap_init_scale", type=float, default=0.01)
     ap.add_argument("--detector_hmap_init_bias", type=float, default=-2.19)
     args = ap.parse_args()
@@ -75,16 +72,11 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
 
-    head_mix_reflections = (args.detector_head_mix_reflections
-                            if args.detector_head_mix_reflections > 0 else None)
     detector = get_spnn_centernet(
         num_classes=args.detector_num_classes,
         pretrained_backbone=None,
         hmap_init_scale=args.detector_hmap_init_scale,
         hmap_init_bias=args.detector_hmap_init_bias,
-        head_mode=args.detector_head_mode,
-        head_mix_type=args.detector_head_mix_type,
-        head_mix_reflections=head_mix_reflections,
         deep_det_head=args.detector_deep_det_head,
         deep_head_hidden=args.detector_deep_head_hidden,
         two_block_head=args.detector_two_block_head,

@@ -41,9 +41,6 @@ trap cleanup SIGTERM
 
 python train.py \
     --arch spnn \
-    --head_mode orthogonal_mix \
-    --head_mix_type householder \
-    --head_mix_reflections 20 \
     --dataset pascal \
     --img_size 256 \
     --batch_size 64 \

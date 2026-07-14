@@ -56,7 +56,8 @@ from nets.spnn_centernet import _DeepHeadConvPINNBlock  # noqa: E402
 
 
 def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley",
-                              scale_bound=2.0, deep_block_hidden=128):
+                              scale_bound=2.0, deep_block_hidden=128,
+                              backbone_block='deep', tail_block='shallow'):
     """Build SPNN for classification.
 
     Architecture (designed to maximize transfer to SPNN-CenterNet detector):
@@ -84,36 +85,58 @@ def build_classification_spnn(num_classes=1000, hidden=256, mix_type="cayley",
     (initialized from hmap_init_bias / log(hmap_init_scale)). All weights
     except those two new params transfer 1-to-1 from classifier to detector.
     """
-    deep_kwargs = lambda i, o: {
+    if backbone_block == 'shallow':
+        # Shallow ConvPINNBlock from models.py: 2-level Sequential U-net per
+        # s/t/r, no GroupNorm. img_size=256 only triggers tailored cases for
+        # specific channel pairs; the 48->44 ... ladder falls to the
+        # auto-scaled default branch which uses feat_size=64.
+        BackboneBlock = ConvPINNBlock
+    elif backbone_block == 'deep':
+        BackboneBlock = _DeepHeadConvPINNBlock
+    else:
+        raise ValueError(f"backbone_block must be 'deep' or 'shallow', got {backbone_block!r}")
+
+    if tail_block == 'shallow':
+        TailBlock = ConvPINNBlock
+    elif tail_block == 'deep':
+        TailBlock = _DeepHeadConvPINNBlock
+    else:
+        raise ValueError(f"tail_block must be 'deep' or 'shallow', got {tail_block!r}")
+
+    backbone_kwargs = lambda i, o: {
         "in_ch": i, "out_ch": o, "hidden": deep_block_hidden,
         "scale_bound": scale_bound, "feat_size": 64, "mix_type": mix_type,
+        "img_size": 256,
     }
     layer_channels = [
         # ----- Stem -----
         (PixelUnshuffleBlock, {"r": 4}),
-        # ----- Shared backbone (6 deep ConvSPNN, x1=4 ladder) -----
-        # Transferred 1-to-1 into the SPNN-CenterNet wrapper.
-        (_DeepHeadConvPINNBlock, deep_kwargs(48, 44)),
-        (_DeepHeadConvPINNBlock, deep_kwargs(44, 40)),
-        (_DeepHeadConvPINNBlock, deep_kwargs(40, 36)),
-        (_DeepHeadConvPINNBlock, deep_kwargs(36, 32)),
-        (_DeepHeadConvPINNBlock, deep_kwargs(32, 28)),
-        # Head boundary: detector takes everything through here, then adds
-        # final_bias / final_log_scale on this block's t/s ConvMLPs.
-        (_DeepHeadConvPINNBlock, deep_kwargs(28, 24)),
-        # ----- Classifier-only tail (3 shallow ConvSPNN) -----
+        # ----- Shared backbone (6 ConvSPNN, x1=4 ladder) -----
+        # Block class controlled by --backbone-block (deep|shallow).
+        # deep   -> _DeepHeadConvPINNBlock w/ _UNet3Skip (transfers to detector)
+        # shallow-> ConvPINNBlock w/ shallow ConvMLP (no GN, no skip-concat)
+        (BackboneBlock, backbone_kwargs(48, 44)),
+        (BackboneBlock, backbone_kwargs(44, 40)),
+        (BackboneBlock, backbone_kwargs(40, 36)),
+        (BackboneBlock, backbone_kwargs(36, 32)),
+        (BackboneBlock, backbone_kwargs(32, 28)),
+        (BackboneBlock, backbone_kwargs(28, 24)),
+        # ----- Classifier-only tail (3 ConvSPNN) -----
+        # Block class controlled by --tail-block (deep|shallow). Deep only
+        # changes block 8 substantively (feat_size=16 routes _UNet3Skip);
+        # blocks 10 and 12 hit identical tailored cases in both ConvMLPs.
         (PixelUnshuffleBlock, {"r": 4}),
-        (ConvPINNBlock, {"in_ch": 384, "out_ch": 64, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 16,
-                         "mix_type": mix_type}),
+        (TailBlock, {"in_ch": 384, "out_ch": 64, "hidden": hidden,
+                     "scale_bound": scale_bound, "feat_size": 16,
+                     "mix_type": mix_type}),
         (PixelUnshuffleBlock, {"r": 4}),
-        (ConvPINNBlock, {"in_ch": 1024, "out_ch": 256, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 4,
-                         "mix_type": mix_type}),
+        (TailBlock, {"in_ch": 1024, "out_ch": 256, "hidden": hidden,
+                     "scale_bound": scale_bound, "feat_size": 4,
+                     "mix_type": mix_type}),
         (PixelUnshuffleBlock, {"r": 4}),
-        (ConvPINNBlock, {"in_ch": 4096, "out_ch": num_classes, "hidden": hidden,
-                         "scale_bound": scale_bound, "feat_size": 1,
-                         "mix_type": mix_type}),
+        (TailBlock, {"in_ch": 4096, "out_ch": num_classes, "hidden": hidden,
+                     "scale_bound": scale_bound, "feat_size": 1,
+                     "mix_type": mix_type}),
     ]
 
     return SPNN(
@@ -212,6 +235,19 @@ parser.add_argument('--deep-block-hidden', default=128, type=int,
                          'widths h, 2h, 4h. Default: 128 (matches the '
                          'detector convention). 256 ~quadruples the deep '
                          'backbone param count.')
+parser.add_argument('--backbone-block', default='deep', choices=['deep', 'shallow'],
+                    help='Backbone block class for the 6 SPNN blocks at 64x64. '
+                         '"deep" = _DeepHeadConvPINNBlock (uses _UNet3Skip with '
+                         'GroupNorm; detector-transfer compatible). "shallow" = '
+                         'ConvPINNBlock from models.py (2-level conv stack, no '
+                         'GroupNorm; fewer params; lower precision-amplification '
+                         'in pinv).')
+parser.add_argument('--tail-block', default='shallow', choices=['deep', 'shallow'],
+                    help='Tail block class for the 3 classifier-only blocks. '
+                         '"deep" routes block 8 (feat=16) through _UNet3Skip '
+                         '(blocks 10, 12 hit identical tailored cases in both '
+                         'ConvMLPs and are unchanged). "shallow" keeps the '
+                         'current production behavior.')
 
 best_acc1 = 0
 
@@ -229,6 +265,8 @@ def main():
                       'which can slow down your training considerably! '
                       'You may see unexpected behavior when restarting '
                       'from checkpoints.')
+    else:
+        cudnn.benchmark = True
 
     if args.gpu is not None:
         warnings.warn('You have chosen a specific GPU. This will completely '
@@ -294,7 +332,9 @@ def main_worker(gpu, ngpus_per_node, args):
     model = build_classification_spnn(num_classes=args.num_classes,
                                       mix_type=args.mix_type,
                                       scale_bound=args.scale_bound,
-                                      deep_block_hidden=args.deep_block_hidden)
+                                      deep_block_hidden=args.deep_block_hidden,
+                                      backbone_block=args.backbone_block,
+                                      tail_block=args.tail_block)
     total_params = sum(p.numel() for p in model.parameters())
     print(f"   Total params: {total_params:,}")
 
@@ -339,7 +379,7 @@ def main_worker(gpu, ngpus_per_node, args):
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
-    
+
     # Scheduler is created after data loaders (cosine needs len(train_loader))
     scheduler = None  # placeholder, created below
 
@@ -407,11 +447,13 @@ def main_worker(gpu, ngpus_per_node, args):
 
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler)
+        num_workers=args.workers, pin_memory=True, sampler=train_sampler,
+        persistent_workers=args.workers > 0, prefetch_factor=4 if args.workers > 0 else None)
 
     val_loader = torch.utils.data.DataLoader(
         val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, sampler=val_sampler)
+        num_workers=args.workers, pin_memory=True, sampler=val_sampler,
+        persistent_workers=args.workers > 0, prefetch_factor=4 if args.workers > 0 else None)
 
     # Create scheduler (needs len(train_loader))
     if args.scheduler == 'cosine':
@@ -524,7 +566,7 @@ def main_worker(gpu, ngpus_per_node, args):
 
 
 def train(train_loader, model, criterion, optimizer, epoch, device, args, scheduler=None):
-    
+
     use_accel = not args.no_accel and torch.accelerator.is_available()
 
     batch_time = AverageMeter('Time', use_accel, ':6.3f', Summary.NONE)
@@ -552,24 +594,25 @@ def train(train_loader, model, criterion, optimizer, epoch, device, args, schedu
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
 
-        # compute output
-        output = model(images)
-        ce_loss = criterion(output, target)
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            # compute output
+            output = model(images)
+            ce_loss = criterion(output, target)
 
-        # SPNN cycle losses (skip computations whose lambda is 0 to save memory)
-        spnn_model = model.module if hasattr(model, 'module') else model
-        if args.lambda_cycle > 0 or args.lambda_rec > 0:
-            x_inv = spnn_model.pinv(output)
-            rec_loss = (x_inv - images).pow(2).mean()
-        else:
-            rec_loss = torch.zeros((), device=output.device)
-        if args.lambda_cycle > 0:
-            y_cycle = model(x_inv)
-            cycle_loss = (y_cycle - output).pow(2).mean()
-        else:
-            cycle_loss = torch.zeros((), device=output.device)
+            # SPNN cycle losses (skip computations whose lambda is 0 to save memory)
+            spnn_model = model.module if hasattr(model, 'module') else model
+            if args.lambda_cycle > 0 or args.lambda_rec > 0:
+                x_inv = spnn_model.pinv(output)
+                rec_loss = (x_inv - images).pow(2).mean()
+            else:
+                rec_loss = torch.zeros((), device=output.device)
+            if args.lambda_cycle > 0:
+                y_cycle = model(x_inv)
+                cycle_loss = (y_cycle - output).pow(2).mean()
+            else:
+                cycle_loss = torch.zeros((), device=output.device)
 
-        loss = ce_loss + args.lambda_cycle * cycle_loss + args.lambda_rec * rec_loss
+            loss = ce_loss + args.lambda_cycle * cycle_loss + args.lambda_rec * rec_loss
 
         # measure accuracy and record loss
         acc1, acc5 = accuracy(output, target, topk=(1, 5))
@@ -633,8 +676,9 @@ def validate(val_loader, model, criterion, args):
                         target = target.to(device)
 
                 # compute output
-                output = model(images)
-                loss = criterion(output, target)
+                with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=(device.type == 'cuda')):
+                    output = model(images)
+                    loss = criterion(output, target)
 
                 # measure accuracy and record loss
                 acc1, acc5 = accuracy(output, target, topk=(1, 5))

@@ -331,23 +331,15 @@ class Diffusion(object):
         assert args.detector_ckpt is not None, \
             "Must provide --detector_ckpt for detection DDNM"
 
-        head_mix_reflections = (args.detector_head_mix_reflections
-                                if args.detector_head_mix_reflections > 0 else None)
         detector = get_spnn_centernet(
             num_classes=args.detector_num_classes,
             pretrained_backbone=None,
             hmap_init_scale=args.detector_hmap_init_scale,
             hmap_init_bias=args.detector_hmap_init_bias,
-            head_mode=args.detector_head_mode,
-            head_mix_type=args.detector_head_mix_type,
-            head_mix_reflections=head_mix_reflections,
             deep_det_head=args.detector_deep_det_head,
             deep_head_hidden=args.detector_deep_head_hidden,
             two_block_head=args.detector_two_block_head,
             freeze_backbone=False,
-            no_hmap_scale=getattr(args, 'no_hmap_scale', False),
-            no_hmap_bias=getattr(args, 'no_hmap_bias', False),
-            internal_head_affine=getattr(args, 'internal_head_affine', False),
         ).to(self.device)
 
         raw = torch.load(args.detector_ckpt, map_location=self.device,
@@ -385,35 +377,21 @@ class Diffusion(object):
             x01_rgb = x01_bgr[:, [2, 1, 0]]
             return x01_rgb * 2.0 - 1.0
 
-        def _wrapper_post_spnn(raw_24ch):
-            hmap = raw_24ch[:, :nc]
-            if getattr(detector, 'use_hmap_scale', True):
-                hmap = hmap * detector.hmap_scale
-            if detector.head_mode == 'orthogonal_mix':
-                hmap = detector.hmap_mix(hmap)
-            if getattr(detector, 'use_hmap_bias', True):
-                hmap = hmap + detector.hmap_bias
-            regs = raw_24ch[:, nc:nc + 2]
-            w_h_ = raw_24ch[:, nc + 2:]
-            return torch.cat([hmap, regs, w_h_], dim=1)
-
         def A(z, return_latents=False):
+            # The SPNN raw output IS the detection output (the per-class
+            # affine lives inside the last head block's s/t, applied
+            # automatically by spnn forward). No external head adapter to
+            # replay, so we can call spnn directly even on the latent path.
             x_det = diffusion_to_detector(z)
             if return_latents:
-                raw, latents = detector.spnn(x_det, return_latents=True)
-                y = _wrapper_post_spnn(raw)
+                y, latents = detector.spnn(x_det, return_latents=True)
                 return y, latents
-            out = detector(x_det)
-            hmap, regs, w_h_ = out[0]
-            return torch.cat([hmap, regs, w_h_], dim=1)
+            return detector.spnn(x_det)
 
         def Ap(y, latents=None):
-            hmap = y[:, :nc]
-            regs = y[:, nc:nc + 2]
-            w_h_ = y[:, nc + 2:]
-            hmap_raw = detector.hmap_to_raw(hmap)
-            raw = torch.cat([hmap_raw, regs, w_h_], dim=1)
-            x_det = detector.spnn.pinv(raw, latents=latents)
+            # No external head adapter to invert; spnn.pinv handles the
+            # internal affine via its sign-flipped log_scale in s.
+            x_det = detector.spnn.pinv(y, latents=latents)
             return detector_to_diffusion(x_det)
 
         return detector, A, Ap

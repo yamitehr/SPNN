@@ -49,22 +49,6 @@ parser.add_argument('--hmap_init_scale', type=float, default=0.01,
 parser.add_argument('--hmap_init_bias', type=float, default=-2.19,
                     help='Initial bias for heatmap affine adapter. CenterNet default '
                          '-2.19 caps SPNN max sigmoid; try 0.0 to remove the ceiling.')
-parser.add_argument('--head_mode', type=str, default='affine',
-                    choices=['affine', 'orthogonal_mix'],
-                    help='Heatmap head structure (both bijective). '
-                         '"affine": per-class scale + bias only. '
-                         '"orthogonal_mix": adds a learnable C×C orthogonal '
-                         'channel mixer between scale and bias.')
-parser.add_argument('--head_mix_type', type=str, default='householder',
-                    choices=['cayley', 'householder'],
-                    help='Parameterization for the orthogonal_mix head. '
-                         '"householder": product of K reflections, bit-exact '
-                         'orthogonal (best for DDNM round-trips). '
-                         '"cayley": matrix_exp(A−Aᵀ); identity init when A=0.')
-parser.add_argument('--head_mix_reflections', type=int, default=0,
-                    help='Number of Householder reflections (0 → default = '
-                         'num_classes, which covers all of O(C)). Ignored '
-                         'when head_mix_type=cayley.')
 parser.add_argument('--deep_det_head', action='store_true',
                     help='Use the deeper 3-level U-net t/s/r networks from '
                          'models_deeper.py for the detector head (block 4) '
@@ -88,31 +72,6 @@ parser.add_argument('--freeze_backbone', action='store_true',
                          'between backbone and head during forward. Only the '
                          'head ConvPINN block(s) and the affine adapter / '
                          'orthogonal mixer receive gradients.')
-parser.add_argument('--no_hmap_scale', action='store_true',
-                    help='Skip the per-class hmap_scale parameter entirely '
-                         '(no construction, no multiplication in forward). '
-                         'Forces the spnn raw hmap channels to act directly '
-                         'as detection logits at the right magnitude.')
-parser.add_argument('--no_hmap_bias', action='store_true',
-                    help='Skip the per-class hmap_bias parameter entirely '
-                         '(no construction, no addition in forward). '
-                         'Forces the spnn raw hmap channels to encode the '
-                         'detection-logit floor (~-2 for negatives) instead '
-                         'of relying on a learned shift.')
-parser.add_argument('--internal_head_affine', action='store_true',
-                    help='Add learnable per-output-channel affine INSIDE the '
-                         "head's s and t networks (the ConvMLPs). "
-                         'self.t.final_bias (additive, init from hmap_init_bias '
-                         'on hmap channels, 0 on regs/wh) and '
-                         'self.s.final_log_scale (multiplicative on the s '
-                         'output, init from log(hmap_init_scale) on hmap, '
-                         '0 on regs/wh). Both are nn.Parameter — learned '
-                         'via the optimizer like any other weight, saved in '
-                         'state_dict, and bijectivity-preserving (the s '
-                         'inverse uses sign-flipped log_scale via the neg '
-                         'flag). Intended use: combined with --no_hmap_scale '
-                         '--no_hmap_bias to relocate the affine from the '
-                         'external head into s/t.')
 parser.add_argument('--img_size', type=int, default=512)
 parser.add_argument('--split_ratio', type=float, default=1.0)
 
@@ -152,10 +111,7 @@ parser.add_argument('--lambda_img_rec', type=float, default=0.0,
 
 # r-net-only training phase. Loads from --pretrain_name, freezes everything
 # except the per-block r-nets, and trains them with G-norm + reconstruction
-# + cycle losses (the recipe from train.py:_train_r_opt_classifier, adapted
-# to the SPNN-CenterNet wrapper). Assumes the ckpt was trained with
-# --no_hmap_scale --no_hmap_bias --internal_head_affine; head_mode is
-# inferred from the ckpt's state_dict (presence of hmap_mix.*).
+# losses. The forward path is reused as-is from the ckpt.
 parser.add_argument('--only_train_r', action='store_true',
                     help='r-net-only training phase. Freezes everything '
                          'except .r submodules; loads init from '
@@ -216,10 +172,9 @@ def train_r_only(model, train_loader, train_sampler, cfg, device, logger, wandb_
       - lambda_r_norm  * ||z(pinv(forward(x))) - z(zeros)||²    (G-norm)
       - lambda_r_rec   * ||pinv(forward(x))    - x||²            (image rec)
 
-    Assumes the wrapper was loaded from a ckpt with no_hmap_scale=True,
-    no_hmap_bias=True, internal_head_affine=True (so the affine lives inside
-    s/t in the last head block). head_mode is whatever was inferred earlier.
     The forward path is frozen, so detection performance is preserved exactly.
+    The per-class affine (when --deep_det_head) lives inside the last head
+    block's s/t and stays frozen along with the rest of the forward path.
     """
     detector = model.module if hasattr(model, 'module') else model
 
@@ -380,10 +335,9 @@ def main():
                                            shuffle=False, num_workers=1, pin_memory=True,
                                            collate_fn=val_dataset.collate_fn)
 
-  # In --only_train_r mode, peek at the pretrained ckpt and infer
-  # head_mode (orthogonal_mix iff any 'hmap_mix' key exists). Force the
-  # internal-affine layout that all r-opt-eligible ckpts use, so the
-  # constructed model matches what the ckpt holds without ambiguity.
+  # In --only_train_r mode, preload the ckpt state_dict so we can load it
+  # into the bare model before DDP wraps it (see comment near load_state_dict
+  # call below for why that ordering matters).
   if cfg.only_train_r:
     assert os.path.isfile(cfg.pretrain_dir), (
         f"--only_train_r requires --pretrain_name pointing at a ckpt; "
@@ -397,15 +351,6 @@ def main():
       _state = _raw
     _state = {k[7:] if k.startswith('module.') else k: v
               for k, v in _state.items()}
-    inferred_head_mode = ('orthogonal_mix'
-                          if any('hmap_mix' in k for k in _state)
-                          else 'affine')
-    print(f'[r-opt] inferred head_mode={inferred_head_mode} from ckpt'
-          f' (overriding --head_mode={cfg.head_mode})')
-    cfg.head_mode = inferred_head_mode
-    cfg.no_hmap_scale = True
-    cfg.no_hmap_bias = True
-    cfg.internal_head_affine = True
     cfg._r_init_state = _state  # reused after model construction
 
   print('Creating model...')
@@ -426,18 +371,10 @@ def main():
                                pretrained_backbone=cfg.spnn_backbone,
                                hmap_init_scale=cfg.hmap_init_scale,
                                hmap_init_bias=cfg.hmap_init_bias,
-                               head_mode=cfg.head_mode,
-                               head_mix_type=cfg.head_mix_type,
-                               head_mix_reflections=(cfg.head_mix_reflections
-                                                     if cfg.head_mix_reflections > 0
-                                                     else None),
                                deep_det_head=cfg.deep_det_head,
                                deep_head_hidden=cfg.deep_head_hidden,
                                two_block_head=cfg.two_block_head,
-                               freeze_backbone=cfg.freeze_backbone,
-                               no_hmap_scale=cfg.no_hmap_scale,
-                               no_hmap_bias=cfg.no_hmap_bias,
-                               internal_head_affine=cfg.internal_head_affine)
+                               freeze_backbone=cfg.freeze_backbone)
   else:
     raise NotImplementedError
 

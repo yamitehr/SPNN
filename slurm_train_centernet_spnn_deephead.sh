@@ -73,9 +73,6 @@ python -m torch.distributed.run \
         --val_interval 5 \
         --log_interval 50 \
         --num_workers 4 \
-        --no_hmap_scale \
-        --no_hmap_bias \
-        --internal_head_affine \
         --data_dir ./data \
         --log_name spnn_centernet_deephead_NOdistill_hidden128_GN_UnetLike_recLoss_v16 \
         --wandb \

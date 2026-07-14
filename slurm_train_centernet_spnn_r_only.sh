@@ -24,9 +24,9 @@
 # frozen. r-net quality after this phase directly improves DDNM's
 # Ap(y, latents=None) reconstruction and the NLBP correction stability.
 #
-# Assumptions (assumed by the r-opt code, not configurable):
-#   - ckpt was trained with --no_hmap_scale --no_hmap_bias --internal_head_affine
-#   - head_mode is INFERRED from the ckpt (presence of hmap_mix.* keys)
+# The forward path is loaded from the pretrained ckpt and frozen; only the
+# per-block r-nets are optimized. The per-class detection-logit affine
+# (when --deep_det_head) lives inside the last head block's s/t.
 #
 # Set PRETRAIN_NAME below to the detection-trained run you want to fine-tune;
 # OUT_NAME is the new ckpt directory under centernet_ref/ckpt/.
@@ -67,9 +67,6 @@ python -m torch.distributed.run \
         --num_epochs 150 \
         --lr 0.001 \
         --num_workers 4 \
-        --no_hmap_scale \
-        --no_hmap_bias \
-        --internal_head_affine \
         --lambda_r_norm 1.0 \
         --lambda_r_rec 10.0 \
         --data_dir ./data \

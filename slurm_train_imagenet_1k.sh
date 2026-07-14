@@ -40,20 +40,20 @@ python train_imagenet.py datasets/imagenet \
     --batch-size 1024 \
     --lr 0.2 \
     --scheduler cosine \
-    --warmup-epochs 5 \
+    --warmup-epochs 8 \
     --scale-bound 1.0 \
     --lambda-cycle 0.0 \
     --lambda-rec 5.0 \
     --workers 64 \
     --print-freq 100 \
-    --checkpoint-dir check_points_cls_imagenet1k_May2_deeper_st \
+    --checkpoint-dir check_points_cls_imagenet1k_May19_b200_bf16 \
     --multiprocessing-distributed \
     --dist-url tcp://127.0.0.1:23456 \
     --world-size 1 \
     --rank 0 \
     --wandb \
     --wandb-project spnn-imagenet \
-    --wandb-run-name imagenet1k-8gpu_May2_deeper_st &
+    --wandb-run-name imagenet1k-8gpu_May19_b200_bf16 &
 
 PID=$!
 wait $PID
